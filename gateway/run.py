@@ -5874,6 +5874,31 @@ class GatewayRunner(GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
 
+    def _apply_display_config_to_platform_extra(
+        self,
+        platform: Platform,
+        config: PlatformConfig,
+    ) -> None:
+        """Inject resolved per-platform display settings into adapter extra.
+
+        Adapter-local values win; resolved display.platforms entries fill only
+        missing keys so explicit PlatformConfig.extra remains authoritative.
+        """
+        if not hasattr(config, "extra") or not isinstance(config.extra, dict):
+            return
+        from gateway.display_config import resolve_display_setting
+
+        try:
+            user_config = _load_gateway_config()
+        except Exception:
+            user_config = {}
+        platform_key = _platform_config_key(platform)
+        for key in ("final_response_format", "markdown_tables", "card_schema"):
+            config.extra.setdefault(
+                key,
+                resolve_display_setting(user_config, platform_key, key),
+            )
+
     def _create_adapter(
         self, 
         platform: Platform, 
@@ -5893,6 +5918,7 @@ class GatewayRunner(GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
                 "thread_sessions_per_user",
                 getattr(self.config, "thread_sessions_per_user", False),
             )
+            self._apply_display_config_to_platform_extra(platform, config)
 
         # ── Plugin-registered platforms (checked first) ───────────────────
         try:

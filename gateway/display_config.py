@@ -35,6 +35,9 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "show_reasoning": False,
     "tool_preview_length": 0,
     "streaming": None,  # None = follow top-level streaming config
+    "final_response_format": "legacy",
+    "markdown_tables": "table",
+    "card_schema": "2.0",
     # Gateway-only assistant/status chatter controls. These default on for
     # back-compat, but mobile platforms can opt down to final-answer-first.
     "interim_assistant_messages": True,
@@ -232,6 +235,15 @@ def _normalise(setting: str, value: Any) -> Any:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
         return bool(value)
+    if setting == "final_response_format":
+        normalized = str(value or "legacy").lower()
+        return normalized if normalized in {"legacy", "auto", "card"} else "legacy"
+    if setting == "markdown_tables":
+        normalized = str(value or "table").lower()
+        return normalized if normalized in {"table", "code", "text"} else "table"
+    if setting == "card_schema":
+        normalized = str(value or "2.0")
+        return normalized if normalized in {"2.0"} else "2.0"
     if setting == "tool_preview_length":
         try:
             return int(value)
