@@ -827,6 +827,9 @@ class TestPromptBuilderConstants:
         assert "Feishu" in hint
         assert "MEDIA:" in hint
         assert "Markdown" in hint
+        assert "Do not assume raw text messages render full Markdown" in hint
+        assert "Feishu renders Markdown in messages" not in hint
+        assert "convert final replies into Feishu cards" in hint
 
     def test_platform_hints_webui(self):
         hint = PLATFORM_HINTS["webui"]

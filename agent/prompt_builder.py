@@ -584,8 +584,10 @@ PLATFORM_HINTS = {
     ),
     "feishu": (
         "You are in a Feishu (Lark) workspace communicating with your user. "
-        "Feishu renders Markdown in messages — bold, italic, code blocks, and "
-        "links are supported. "
+        "Do not assume raw text messages render full Markdown. The gateway may "
+        "convert final replies into Feishu cards for rich display, including "
+        "tables and code blocks. Use clear structure when helpful, but avoid "
+        "unnecessary Markdown decoration. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.jpg, .png, .webp) are uploaded and displayed "
         "inline, audio files as voice messages, and other files as attachments."
