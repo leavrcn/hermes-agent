@@ -4823,3 +4823,14 @@ class BasePlatformAdapter(ABC):
             ]
 
         return chunks
+
+def iter_media_tag_paths(content: str) -> List[str]:
+    """Return deliverable MEDIA:<path> paths using the canonical media parser.
+
+    This delegates to ``BasePlatformAdapter.extract_media`` so card-rendering
+    decisions share the same quoted-path, Windows-path, extension, and
+    protected-span behavior as native attachment delivery.
+    """
+    media, _cleaned = BasePlatformAdapter.extract_media(content or "")
+    return [path for path, _is_voice in media]
+

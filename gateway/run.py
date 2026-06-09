@@ -684,6 +684,25 @@ def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     return None
 
 
+def _collect_tool_media_tags(content: str, history_media_paths: Optional[set] = None) -> tuple[List[str], bool]:
+    """Collect deliverable MEDIA tags from a single tool-result content string.
+
+    Compatibility helper for tests and future card/media boundary checks. Uses
+    the canonical BasePlatformAdapter media parser so quoted/backticked paths
+    match native delivery behavior.
+    """
+    from gateway.platforms.base import BasePlatformAdapter
+
+    history_media_paths = history_media_paths or set()
+    has_voice_directive = "[[audio_as_voice]]" in (content or "")
+    media, _cleaned = BasePlatformAdapter.extract_media(content or "")
+    tags: List[str] = []
+    for path, _is_voice in media:
+        if path not in history_media_paths:
+            tags.append(f"MEDIA:{path}")
+    return tags, has_voice_directive
+
+
 # Tool results can contain literal MEDIA: examples in docs, logs, or other
 # ordinary outputs. Only tools that intentionally create deliverable media
 # artifacts should be eligible for automatic append when the model omits them
