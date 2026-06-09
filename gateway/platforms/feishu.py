@@ -139,7 +139,10 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
+    should_send_media_as_audio,
+    iter_media_tag_paths,
 )
+from gateway.platforms.feishu_card_renderer import build_feishu_card_v2_payload
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -1767,6 +1770,23 @@ class FeishuAdapter(BasePlatformAdapter):
             self._webhook_runner = None
             self._webhook_site = None
 
+    def _should_send_final_response_as_card(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Return True when this outbound send should use Feishu card v2."""
+        if not isinstance(metadata, dict) or not metadata.get("hermes_final_response"):
+            return False
+        mode = str(self.config.extra.get("final_response_format") or "legacy").strip().lower()
+        if mode not in {"card", "auto"}:
+            return False
+        # Auto mode keeps legacy delivery for responses with native attachments so
+        # the shared BasePlatformAdapter extraction path can deliver MEDIA files.
+        if mode == "auto" and iter_media_tag_paths(content or ""):
+            return False
+        return True
+
     # =========================================================================
     # Outbound — send / edit / send_image / send_voice / …
     # =========================================================================
@@ -1781,6 +1801,26 @@ class FeishuAdapter(BasePlatformAdapter):
         """Send a Feishu message."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
+
+        if self._should_send_final_response_as_card(content, metadata):
+            card_payload = build_feishu_card_v2_payload(
+                content,
+                table_policy=str(self.config.extra.get("markdown_tables") or "table"),
+            )
+            try:
+                response = await self._feishu_send_with_retry(
+                    chat_id=chat_id,
+                    msg_type="interactive",
+                    payload=card_payload,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                return self._finalize_send_result(response, "send final response card failed")
+            except Exception as exc:
+                logger.warning(
+                    "[Feishu] Final response card send failed; falling back to legacy payload: %s",
+                    exc,
+                )
 
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
