@@ -74,7 +74,7 @@ class TestSearXNGSearchProviderSearch:
         mock_resp = self._make_mock_response(self._SAMPLE_RESPONSE)
 
         with patch("httpx.get", return_value=mock_resp):
-            result = SearXNGWebSearchProvider().search("test query", limit=5)
+            result = SearXNGWebSearchProvider().search("plain navigational docs query", limit=5)
 
         assert result["success"] is True
         web = result["data"]["web"]
@@ -98,7 +98,7 @@ class TestSearXNGSearchProviderSearch:
         mock_resp = self._make_mock_response(unordered)
 
         with patch("httpx.get", return_value=mock_resp):
-            result = SearXNGWebSearchProvider().search("query", limit=5)
+            result = SearXNGWebSearchProvider().search("plain query", limit=5)
 
         assert result["success"] is True
         assert result["data"]["web"][0]["title"] == "High"
@@ -111,7 +111,7 @@ class TestSearXNGSearchProviderSearch:
         mock_resp = self._make_mock_response(self._SAMPLE_RESPONSE)
 
         with patch("httpx.get", return_value=mock_resp):
-            result = SearXNGWebSearchProvider().search("query", limit=2)
+            result = SearXNGWebSearchProvider().search("plain docs", limit=2)
 
         assert result["success"] is True
         assert len(result["data"]["web"]) == 2
@@ -122,7 +122,7 @@ class TestSearXNGSearchProviderSearch:
         mock_resp = self._make_mock_response(self._SAMPLE_RESPONSE)
 
         with patch("httpx.get", return_value=mock_resp):
-            result = SearXNGWebSearchProvider().search("query", limit=5)
+            result = SearXNGWebSearchProvider().search("plain query", limit=5)
 
         positions = [r["position"] for r in result["data"]["web"]]
         assert positions == [1, 2, 3]
@@ -133,7 +133,7 @@ class TestSearXNGSearchProviderSearch:
         mock_resp = self._make_mock_response({"results": []})
 
         with patch("httpx.get", return_value=mock_resp):
-            result = SearXNGWebSearchProvider().search("nothing", limit=5)
+            result = SearXNGWebSearchProvider().search("plain nothing", limit=5)
 
         assert result["success"] is True
         assert result["data"]["web"] == []
@@ -151,7 +151,7 @@ class TestSearXNGSearchProviderSearch:
         mock_resp = self._make_mock_response(data)
 
         with patch("httpx.get", return_value=mock_resp):
-            result = SearXNGWebSearchProvider().search("query", limit=5)
+            result = SearXNGWebSearchProvider().search("plain query", limit=5)
 
         assert result["success"] is True
         # Has score should sort first (0.8 > 0)
@@ -167,7 +167,7 @@ class TestSearXNGSearchProviderSearch:
         http_err = httpx.HTTPStatusError("500", request=MagicMock(), response=mock_resp)
 
         with patch("httpx.get", side_effect=http_err):
-            result = SearXNGWebSearchProvider().search("query", limit=5)
+            result = SearXNGWebSearchProvider().search("plain query", limit=5)
 
         assert result["success"] is False
         assert "500" in result["error"]
@@ -178,7 +178,7 @@ class TestSearXNGSearchProviderSearch:
         from plugins.web.searxng.provider import SearXNGWebSearchProvider
 
         with patch("httpx.get", side_effect=httpx.RequestError("connection refused")):
-            result = SearXNGWebSearchProvider().search("query", limit=5)
+            result = SearXNGWebSearchProvider().search("plain query", limit=5)
 
         assert result["success"] is False
         assert "localhost:8080" in result["error"] or "connection" in result["error"].lower()
@@ -187,7 +187,7 @@ class TestSearXNGSearchProviderSearch:
         monkeypatch.delenv("SEARXNG_URL", raising=False)
         from plugins.web.searxng.provider import SearXNGWebSearchProvider
 
-        result = SearXNGWebSearchProvider().search("query", limit=5)
+        result = SearXNGWebSearchProvider().search("plain query", limit=5)
         assert result["success"] is False
         assert "SEARXNG_URL" in result["error"]
 
@@ -203,9 +203,58 @@ class TestSearXNGSearchProviderSearch:
             return mock_resp
 
         with patch("httpx.get", side_effect=capture_get):
-            SearXNGWebSearchProvider().search("query", limit=5)
+            SearXNGWebSearchProvider().search("plain query", limit=5)
 
         assert calls[0] == "http://localhost:8080/search", f"Got: {calls[0]}"
+
+    def test_finance_event_queries_search_general_and_news_then_merge(self, monkeypatch):
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+
+        def capture_get(url, **kwargs):
+            params = kwargs["params"]
+            if params.get("categories") == "general":
+                return self._make_mock_response({
+                    "results": [
+                        {"title": "Company facts", "url": "https://example.com/company", "content": "general", "score": 0.8},
+                        {"title": "Duplicate lower", "url": "https://example.com/dup", "content": "general dup", "score": 0.2},
+                    ]
+                })
+            if params.get("categories") == "news":
+                return self._make_mock_response({
+                    "results": [
+                        {"title": "Fresh market news", "url": "https://example.com/news", "content": "news", "score": 0.75},
+                        {"title": "Duplicate higher", "url": "https://example.com/dup", "content": "news dup", "score": 0.7},
+                    ]
+                })
+            raise AssertionError(f"unexpected params: {params}")
+
+        with patch("httpx.get", side_effect=capture_get) as mocked_get:
+            result = SearXNGWebSearchProvider().search("A股 机器人 板块 龙头 业绩", limit=5)
+
+        assert result["success"] is True
+        assert mocked_get.call_count == 2
+        requested_categories = [call.kwargs["params"].get("categories") for call in mocked_get.call_args_list]
+        assert requested_categories == ["general", "news"]
+        web = result["data"]["web"]
+        assert [item["url"] for item in web] == [
+            "https://example.com/news",
+            "https://example.com/dup",
+            "https://example.com/company",
+        ]
+        assert web[1]["description"] == "news dup"
+
+    def test_non_event_queries_keep_single_default_search(self, monkeypatch):
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response(self._SAMPLE_RESPONSE)
+
+        with patch("httpx.get", return_value=mock_resp) as mocked_get:
+            result = SearXNGWebSearchProvider().search("Hermes Agent documentation", limit=5)
+
+        assert result["success"] is True
+        assert mocked_get.call_count == 1
+        assert "categories" not in mocked_get.call_args.kwargs["params"]
 
 
 # ---------------------------------------------------------------------------

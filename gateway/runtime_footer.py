@@ -30,6 +30,42 @@ from typing import Any, Iterable, Optional
 
 _DEFAULT_FIELDS: tuple[str, ...] = ("model", "context_pct", "cwd")
 _SEP = " · "
+_FOOTER_MARKER = "<!-- HERMES_RUNTIME_FOOTER -->"
+
+
+def mark_footer_line(line: str) -> str:
+    """Prefix *line* with a transport marker so renderers can keep it last.
+
+    Feishu final replies can combine text and images into a single card.  The
+    generic gateway appends runtime metadata before the adapter extracts MEDIA
+    tags, so without a marker the Feishu card renderer sees the footer as normal
+    body text and appends image blocks after it.  Marking lets Feishu strip the
+    marker and re-append the footer after rich media while preserving the visible
+    footer text.
+    """
+    if not line:
+        return ""
+    return f"{_FOOTER_MARKER}\n{line}"
+
+
+def split_marked_footer(text: str) -> tuple[str, str]:
+    """Return ``(body, footer)`` for text containing a marked footer line.
+
+    If no marker is present, the input is returned unchanged with an empty
+    footer.  The helper is intentionally plain-string based so it is safe to use
+    before Markdown parsing or legacy text fallback formatting.
+    """
+    if not text or _FOOTER_MARKER not in text:
+        return text, ""
+    body, footer = text.rsplit(_FOOTER_MARKER, 1)
+    return body.rstrip(), footer.strip()
+
+
+def strip_footer_marker(text: str) -> str:
+    """Remove the internal footer marker while keeping the visible footer."""
+    if not text:
+        return text
+    return text.replace(_FOOTER_MARKER + "\n", "").replace(_FOOTER_MARKER, "")
 
 
 def _home_relative_cwd(cwd: str) -> str:

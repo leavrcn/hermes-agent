@@ -33,7 +33,6 @@ _AUDIO_EXTS = frozenset({'.ogg', '.opus', '.mp3', '.wav', '.m4a', '.flac'})
 # delivered as a regular document.
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
-_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
 
 
 def _platform_name(platform) -> str:
@@ -1545,13 +1544,6 @@ class SendResult:
     message_id: Optional[str] = None
     error: Optional[str] = None
     raw_response: Any = None
-    # Adapter-specific metadata.  Cross-layer contracts that affect delivery
-    # semantics must be documented at the producer and consumer sites.  Current
-    # known contract: Telegram edit overflow partials set
-    # raw_response["partial_overflow"] with delivered_chunks, total_chunks,
-    # last_message_id, delivered_prefix, and continuation_message_ids so the
-    # stream consumer can send the missing tail instead of marking a clipped
-    # response complete.
     retryable: bool = False  # True for transient connection errors — base will retry automatically
     # When the adapter had to split an oversized payload across multiple
     # platform messages (e.g. Telegram edit_message overflow split-and-deliver),
@@ -1803,25 +1795,10 @@ class BasePlatformAdapter(ABC):
 
     # Whether this platform renders triple-backtick fenced code blocks (i.e.
     # ``format_message`` translates/preserves markdown fences into a real code
-    # block).  Capability flag for markdown-aware presentation choices.
+    # block).  Drives presentation choices like rendering a ``terminal`` tool
+    # call's command as a ```bash block instead of a flat preview line.
     # Default False (plain-text platforms); markdown-rendering adapters set True.
-    # Tool-progress uses this to render a terminal command as a bare fenced code
-    # block (no language tag — Slack mrkdwn would print the tag as a literal
-    # first code line).  Plain-text platforms fall back to the short truncated
-    # preview (see gateway/run.py progress_callback).
     supports_code_blocks: bool = False
-
-    # The command prefix users can always TYPE on this platform to reach
-    # Hermes commands.  Default "/" (most platforms deliver "/approve" etc.
-    # as plain message text).  Platforms where typing a leading "/" is
-    # intercepted or restricted by the client (Slack blocks native slash
-    # commands inside threads; Matrix clients reserve "/" for client-local
-    # commands) ship a "!" alias rewrite in their adapter and set this to
-    # "!" so user-facing instruction text ("Reply `!approve` ...") tells
-    # users the form that actually works everywhere.  Capability flag —
-    # shared prompt builders read it via getattr(adapter,
-    # "typed_command_prefix", "/"); no per-platform branching at call sites.
-    typed_command_prefix: str = "/"
 
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
@@ -4055,6 +4032,28 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    async def try_send_final_rich_response(
+        self,
+        *,
+        chat_id: str,
+        original_response: str,
+        text_content: str,
+        images: List[Tuple[str, str]],
+        media_files: List[Tuple[str, bool]],
+        local_files: List[str],
+        force_document_attachments: bool,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        is_ephemeral_response: bool = False,
+    ) -> Optional[SendResult]:
+        """Optionally send a platform-native rich final response.
+
+        Subclasses can override this to combine the already-extracted text and
+        media into one richer platform message. Return ``None`` to let the base
+        legacy text/media delivery continue unchanged.
+        """
+        return None
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -4243,21 +4242,49 @@ class BasePlatformAdapter(ABC):
                             pass
 
                 # Send the text portion
-                if text_content and not _tts_caption_delivered:
+                _reply_anchor = _reply_anchor_for_event(event)
+                # Mark final response messages for notification delivery.
+                # Platform adapters that support per-message notification
+                # control (e.g. Telegram's disable_notification) use this
+                # flag to override silent-mode and ensure the final
+                # response triggers a push notification.
+                # Clone to avoid mutating the metadata shared with the
+                # typing-indicator task (which must remain unmarked).
+                if _thread_metadata is not None:
+                    _thread_metadata = dict(_thread_metadata)
+                    _thread_metadata["notify"] = True
+                    _thread_metadata["hermes_final_response"] = True
+                else:
+                    _thread_metadata = {"notify": True, "hermes_final_response": True}
+
+                _rich_final_response_delivered = False
+                if not _tts_caption_delivered:
+                    try:
+                        _rich_result = await self.try_send_final_rich_response(
+                            chat_id=event.source.chat_id,
+                            original_response=_response_pre_extract,
+                            text_content=text_content,
+                            images=list(images),
+                            media_files=list(media_files),
+                            local_files=list(local_files),
+                            force_document_attachments=force_document_attachments,
+                            reply_to=_reply_anchor,
+                            metadata=_thread_metadata,
+                            is_ephemeral_response=is_ephemeral_response,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[%s] Final rich response hook failed; falling back to legacy delivery",
+                            self.name,
+                            exc_info=True,
+                        )
+                        _rich_result = None
+                    if _rich_result is not None and getattr(_rich_result, "success", False):
+                        _record_delivery(_rich_result)
+                        _rich_final_response_delivered = True
+
+                if text_content and not _tts_caption_delivered and not _rich_final_response_delivered:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
-                    _reply_anchor = _reply_anchor_for_event(event)
-                    # Mark final response messages for notification delivery.
-                    # Platform adapters that support per-message notification
-                    # control (e.g. Telegram's disable_notification) use this
-                    # flag to override silent-mode and ensure the final
-                    # response triggers a push notification.
-                    # Clone to avoid mutating the metadata shared with the
-                    # typing-indicator task (which must remain unmarked).
-                    if _thread_metadata is not None:
-                        _thread_metadata = dict(_thread_metadata)
-                        _thread_metadata["notify"] = True
-                    else:
-                        _thread_metadata = {"notify": True}
                     result = await self._send_with_retry(
                         chat_id=event.source.chat_id,
                         content=text_content,
@@ -4285,7 +4312,7 @@ class BasePlatformAdapter(ABC):
                 human_delay = self._get_human_delay()
 
                 # Send extracted images as native attachments
-                if images:
+                if images and not _rich_final_response_delivered:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
                         await self.send_multiple_images(
@@ -4297,6 +4324,10 @@ class BasePlatformAdapter(ABC):
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
+
+                if _rich_final_response_delivered:
+                    media_files = []
+                    local_files = []
 
                 # Send extracted media files — route by file type
                 _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
@@ -4482,15 +4513,6 @@ class BasePlatformAdapter(ABC):
             except Exception:
                 pass  # Last resort — don't let error reporting crash the handler
         finally:
-            # Stop typing before any deferred callback work.  Post-delivery
-            # callbacks may perform platform I/O; a stuck callback must not
-            # leave the typing refresh task running indefinitely.
-            await _stop_typing_task()
-            try:
-                if hasattr(self, "stop_typing"):
-                    await self.stop_typing(event.source.chat_id)
-            except Exception:
-                pass
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).
             #
@@ -4518,12 +4540,11 @@ class BasePlatformAdapter(ABC):
                 try:
                     _post_result = _post_cb()
                     if inspect.isawaitable(_post_result):
-                        await asyncio.wait_for(
-                            _post_result,
-                            timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
-                        )
-                except (asyncio.TimeoutError, Exception):
+                        await _post_result
+                except Exception:
                     pass
+            # Stop typing indicator
+            await _stop_typing_task()
             # Also cancel any platform-level persistent typing tasks (e.g. Discord)
             # that may have been recreated by _keep_typing after the last stop_typing()
             try:
@@ -4681,7 +4702,6 @@ class BasePlatformAdapter(ABC):
         guild_id: Optional[str] = None,
         parent_chat_id: Optional[str] = None,
         message_id: Optional[str] = None,
-        role_authorized: bool = False,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
         # Normalize empty topic to None
@@ -4702,7 +4722,6 @@ class BasePlatformAdapter(ABC):
             guild_id=str(guild_id) if guild_id else None,
             parent_chat_id=str(parent_chat_id) if parent_chat_id else None,
             message_id=str(message_id) if message_id else None,
-            role_authorized=role_authorized,
         )
     
     @abstractmethod
@@ -4858,3 +4877,14 @@ class BasePlatformAdapter(ABC):
             ]
 
         return chunks
+
+def iter_media_tag_paths(content: str) -> List[str]:
+    """Return deliverable MEDIA:<path> paths using the canonical media parser.
+
+    This delegates to ``BasePlatformAdapter.extract_media`` so card-rendering
+    decisions share the same quoted-path, Windows-path, extension, and
+    protected-span behavior as native attachment delivery.
+    """
+    media, _cleaned = BasePlatformAdapter.extract_media(content or "")
+    return [path for path, _is_voice in media]
+

@@ -405,6 +405,38 @@ For small text-based documents (.txt, .md), the file content is automatically in
 | `send_video` | Uploads video and sends as native media message |
 | `send_animation` | GIFs are downgraded to file attachments (Feishu has no native GIF bubble) |
 
+### Final Reply Cards
+
+Feishu/Lark can render final assistant replies as Card JSON 2.0 instead of plain `post` messages. Configure this under the Feishu platform display settings:
+
+```yaml
+display:
+  platforms:
+    feishu:
+      final_response_format: auto  # legacy | auto | card
+      markdown_tables: table       # table | code
+      card_schema: "2.0"
+```
+
+Modes:
+
+| Mode | Behavior |
+|------|----------|
+| `legacy` | Default compatibility mode. Final replies use the classic text/post/media delivery path. |
+| `auto` | Use Card v2 for normal final replies, but keep the legacy media path when native `MEDIA:` attachments are present. |
+| `card` | Prefer Card v2 for final replies. Safe image attachments (`.jpg`, `.jpeg`, `.png`, `.webp`) are uploaded and embedded inside the same card as `img` elements; unsupported media falls back to the legacy delivery path. |
+
+Card rendering splits long replies into multiple cards for readability and API safety. Current defaults are:
+
+| Limit | Default |
+|-------|---------|
+| Maximum Markdown characters per element | `3000` |
+| Maximum elements per card | `20` |
+| Approximate maximum content characters per card | `6000` |
+| Native table promotion limit | Up to `5` tables, each with at most `8` columns and `20` rows |
+
+Image-rich final cards currently embed up to three safe images per final response. If image upload or card sending fails, Hermes falls back to the legacy Feishu post/media flow so the reply is still delivered.
+
 File upload routing is automatic based on extension:
 
 - `.ogg`, `.opus` → uploaded as `opus` audio

@@ -337,18 +337,50 @@ python -m gateway.platforms.feishu_comment_rules pairing remove <user_open_id>
 
 对于小型文本文档（.txt, .md），文件内容会自动注入消息文本，使 Agent 无需工具即可直接读取。
 
-### 出站（发送）
+### 发送（Outbound）
 
 | 方法 | 发送内容 |
 |--------|--------------|
 | `send` | 文本或富文本 post 消息（根据 markdown 内容自动检测） |
-| `send_image` / `send_image_file` | 上传图片到飞书，然后以原生图片气泡发送（可附带说明文字） |
-| `send_document` | 上传文件到飞书 API，然后以文件附件发送 |
-| `send_voice` | 以飞书文件附件形式上传音频文件 |
-| `send_video` | 上传视频并以原生媒体消息发送 |
-| `send_animation` | GIF 降级为文件附件（飞书不支持原生 GIF 气泡） |
+| `send_image` / `send_image_file` | 将图片上传到飞书，然后作为原生图片气泡发送（可带 caption） |
+| `send_document` | 将文件上传到飞书 API，然后作为文件附件发送 |
+| `send_voice` | 将音频文件作为飞书文件附件上传 |
+| `send_video` | 上传视频并作为原生媒体消息发送 |
+| `send_animation` | GIF 会降级为文件附件（飞书没有原生 GIF 气泡） |
 
-文件上传路由根据扩展名自动判断：
+### 最终回复卡片
+
+飞书/Lark 可以把最终 assistant 回复渲染为 Card JSON 2.0，而不是普通 `post` 消息。可在飞书平台的显示配置中启用：
+
+```yaml
+display:
+  platforms:
+    feishu:
+      final_response_format: auto  # legacy | auto | card
+      markdown_tables: table       # table | code
+      card_schema: "2.0"
+```
+
+模式：
+
+| 模式 | 行为 |
+|------|------|
+| `legacy` | 默认兼容模式。最终回复走经典 text/post/media 投递路径。 |
+| `auto` | 普通最终回复使用 Card v2；当回复包含原生 `MEDIA:` 附件时保留 legacy 媒体投递路径。 |
+| `card` | 优先使用 Card v2。安全图片附件（`.jpg`、`.jpeg`、`.png`、`.webp`）会先上传并作为 `img` 元素嵌入同一张卡片；不支持的媒体会回退到 legacy 投递路径。 |
+
+卡片渲染会把长回复拆成多张卡片，以兼顾可读性和 API 安全。当前默认值：
+
+| 限制项 | 默认值 |
+|-------|--------|
+| 单个 Markdown 元素最大字符数 | `3000` |
+| 单张卡片最大元素数 | `20` |
+| 单张卡片近似最大内容字符数 | `6000` |
+| 原生表格提升限制 | 最多 `5` 个表格；每个表格最多 `8` 列、`20` 行 |
+
+图文最终卡片目前每次最多嵌入三张安全图片。如果图片上传或卡片发送失败，Hermes 会回退到 legacy 飞书 post/media 流程，确保回复仍能送达。
+
+文件上传路由会根据扩展名自动选择：
 
 - `.ogg`, `.opus` → 以 `opus` 音频上传
 - `.mp4`, `.mov`, `.avi`, `.m4v` → 以 `mp4` 媒体上传
