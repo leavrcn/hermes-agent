@@ -57,6 +57,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import threading
 import time
@@ -207,6 +208,9 @@ _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
 _DEFAULT_TEXT_BATCH_MAX_CHARS = 4000
 _DEFAULT_MEDIA_BATCH_DELAY_SECONDS = 0.8
+_FEISHU_OUTER_REQUEST_MAX_BYTES = 30 * 1024
+_FEISHU_MULTICARD_MIN_INTERVAL_SECONDS = 0.22
+_FEISHU_MULTICARD_JITTER_MAX_SECONDS = 0.03
 _DEFAULT_DEDUP_CACHE_SIZE = 2048
 _DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 _DEFAULT_WEBHOOK_PORT = 8765
@@ -249,6 +253,36 @@ async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> byt
     if len(body) > max_bytes:
         raise ValueError("payload too large")
     return body
+
+
+async def _sleep_between_feishu_multicard_parts(
+    *,
+    sleep: Optional[Any] = None,
+    jitter: Optional[Any] = None,
+) -> None:
+    """Throttle one boundary inside a single multi-card delivery batch."""
+    sleep_fn = sleep or asyncio.sleep
+    jitter_fn = jitter or random.uniform
+    delay = _FEISHU_MULTICARD_MIN_INTERVAL_SECONDS + jitter_fn(
+        0.0,
+        _FEISHU_MULTICARD_JITTER_MAX_SECONDS,
+    )
+    await sleep_fn(delay)
+
+
+def _serialized_sdk_request_body_size(request_body: Any) -> int:
+    """Return the exact UTF-8 size of an SDK request body's JSON fields."""
+    fields = getattr(request_body, "__dict__", request_body)
+    return len(json.dumps(fields, ensure_ascii=False).encode("utf-8"))
+
+
+def _validate_interactive_request_body_size(request_body: Any) -> None:
+    size = _serialized_sdk_request_body_size(request_body)
+    if size >= _FEISHU_OUTER_REQUEST_MAX_BYTES:
+        raise ValueError(
+            "Feishu interactive SDK request body exceeds 30 KiB hard limit: "
+            f"{size} bytes"
+        )
 
 
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
@@ -1996,7 +2030,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 table_policy=self._final_response_table_policy(),
                 image_key_by_source=image_key_by_source,
             )
-            for payload in payloads:
+            for part_index, payload in enumerate(payloads):
+                if part_index:
+                    await _sleep_between_feishu_multicard_parts()
                 response = await self._feishu_send_with_retry(
                     chat_id=chat_id,
                     msg_type="interactive",
@@ -2069,7 +2105,9 @@ class FeishuAdapter(BasePlatformAdapter):
                     content,
                     table_policy=self._final_response_table_policy(),
                 )
-                for card_payload in payloads:
+                for part_index, card_payload in enumerate(payloads):
+                    if part_index:
+                        await _sleep_between_feishu_multicard_parts()
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="interactive",
