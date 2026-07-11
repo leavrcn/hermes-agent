@@ -1,6 +1,6 @@
 """Tests for the gateway Markdown-to-document parser."""
 
-from gateway.rendering.document import DividerBlock, TableBlock
+from gateway.rendering.document import DividerBlock, ParagraphBlock, TableBlock
 from gateway.rendering.markdown_parser import parse_markdown_document
 
 
@@ -64,3 +64,53 @@ def test_escaped_pipe_at_line_start():
     )
     table = doc.blocks[0]
     assert table.rows[0] == ["\\|content"]
+
+
+def test_double_backtick_inline_code_pipe_stays_inside_cell():
+    doc = parse_markdown_document(
+        "| A | B |\n| --- | --- |\n| ``foo|bar`` | ok |"
+    )
+
+    assert len(doc.blocks) == 1
+    table = doc.blocks[0]
+    assert isinstance(table, TableBlock)
+    assert table.rows == [["``foo|bar``", "ok"]]
+
+
+def test_matching_backtick_run_length_controls_inline_span():
+    doc = parse_markdown_document(
+        "| A | B |\n"
+        "| --- | --- |\n"
+        "| ``foo`|bar`` | ok |\n"
+        "| ```one``|two``` | kept |\n"
+        "| ````left```|right```` | preserved |"
+    )
+
+    assert len(doc.blocks) == 1
+    table = doc.blocks[0]
+    assert isinstance(table, TableBlock)
+    assert table.rows == [
+        ["``foo`|bar``", "ok"],
+        ["```one``|two```", "kept"],
+        ["````left```|right````", "preserved"],
+    ]
+
+
+def test_later_uncertain_row_degrades_entire_table_without_loss():
+    markdown = (
+        "| A | B |\n"
+        "| --- | --- |\n"
+        "| first | ok |\n"
+        "| `uncertain | still here |\n"
+        "| after | survives |"
+    )
+
+    doc = parse_markdown_document(markdown)
+
+    assert len(doc.blocks) == 1
+    block = doc.blocks[0]
+    assert isinstance(block, ParagraphBlock)
+    assert block.text == markdown
+    assert "| first | ok |" in block.text
+    assert "| `uncertain | still here |" in block.text
+    assert "| after | survives |" in block.text

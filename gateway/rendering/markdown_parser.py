@@ -91,7 +91,7 @@ def parse_markdown_document(text: str) -> MessageDocument:
     return MessageDocument(blocks=blocks)
 
 
-def _parse_table_at(lines: list[str], start: int) -> tuple[TableBlock, int] | None:
+def _parse_table_at(lines: list[str], start: int) -> tuple[TableBlock | ParagraphBlock, int] | None:
     if start + 1 >= len(lines):
         return None
     header = _split_table_row(lines[start])
@@ -103,15 +103,25 @@ def _parse_table_at(lines: list[str], start: int) -> tuple[TableBlock, int] | No
 
     raw_lines = [lines[start], lines[start + 1]]
     rows: list[list[str]] = []
+    uncertain = False
     i = start + 2
     while i < len(lines):
-        row = _split_table_row(lines[i])
-        if not row:
+        candidate = lines[i]
+        if not candidate.strip() or "|" not in candidate:
             break
-        raw_lines.append(lines[i])
-        rows.append(_fit_row(row, len(header)))
+        raw_lines.append(candidate)
+        row = _split_table_row(candidate)
+        if row is None:
+            uncertain = True
+        else:
+            rows.append(_fit_row(row, len(header)))
         i += 1
 
+    # Do not commit a partial TableBlock. Once a header and separator establish
+    # a table candidate, every contiguous pipe-bearing row must be safe to
+    # split; otherwise preserve the complete candidate as raw Markdown.
+    if uncertain:
+        return ParagraphBlock("\n".join(raw_lines)), i
     if not rows:
         return None
     return TableBlock(headers=header, rows=rows, raw_markdown="\n".join(raw_lines)), i
@@ -133,38 +143,66 @@ def _split_table_row(line: str) -> list[str] | None:
         stripped = stripped[:-1]
 
     # Minimal state machine: track backslash-escape and backtick spans
-    # so that \| and `a|b` are not treated as column delimiters.
+    # so that \| and `a|b` are not treated as column delimiters. A code
+    # span closes only on a backtick run matching its opening run length.
     cells: list[str] = []
     current: list[str] = []
     escaped = False
-    in_backtick = False
+    backtick_delimiter = 0
+    i = 0
 
-    for ch in stripped:
+    while i < len(stripped):
+        ch = stripped[i]
+
+        if backtick_delimiter:
+            if ch == "`":
+                run_end = i + 1
+                while run_end < len(stripped) and stripped[run_end] == "`":
+                    run_end += 1
+                run = stripped[i:run_end]
+                current.append(run)
+                if len(run) == backtick_delimiter:
+                    backtick_delimiter = 0
+                i = run_end
+                continue
+            current.append(ch)
+            i += 1
+            continue
+
         if escaped:
             # Previous char was backslash; this char is literal (including |)
             current.append(ch)
             escaped = False
+            i += 1
             continue
 
         if ch == "\\":
             escaped = True
             current.append(ch)
+            i += 1
             continue
 
         if ch == "`":
-            in_backtick = not in_backtick
-            current.append(ch)
+            run_end = i + 1
+            while run_end < len(stripped) and stripped[run_end] == "`":
+                run_end += 1
+            run = stripped[i:run_end]
+            backtick_delimiter = len(run)
+            current.append(run)
+            i = run_end
             continue
 
-        if ch == "|" and not in_backtick:
+        if ch == "|":
             cells.append("".join(current).strip())
             current = []
+            i += 1
             continue
 
         current.append(ch)
+        i += 1
 
     # Unclosed backtick → ambiguous; signal failure so caller degrades safely
-    if in_backtick:
+    if backtick_delimiter:
         return None
 
     # Trailing backslash (dangling escape) → ambiguous
