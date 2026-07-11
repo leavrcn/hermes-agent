@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
 from ruamel.yaml import YAML
 
 
@@ -38,6 +39,26 @@ EXPECTED_REMOVED_PATHS = {
     "gateway.platforms.feishu.extra.card_schema",
     "platforms.feishu.extra.card_schema",
 }
+
+
+BYTE_STABLE_CONFIG = """\
+# formatting below is intentionally unlike ruamel's default dump
+display:
+  platforms:
+    feishu:
+      card_schema: "2.0"  # delete target display
+      long_plain: this is a deliberately long plain scalar that must remain on exactly the same physical line without wrapping or reformatting
+      compact_sequence:
+      - alpha
+      - beta
+gateway:
+    platforms:
+      feishu:
+        extra: {markdown_tables: table, final_response_format: card}
+        card_schema: '2.0'  # delete target gateway
+unrelated:
+  card_schema: keep-me
+"""
 
 
 def _migration_module():
@@ -109,3 +130,59 @@ def test_migration_prints_exact_removed_yaml_paths(tmp_path, capsys):
 
     output_lines = set(capsys.readouterr().out.splitlines())
     assert output_lines == {f"Would remove: {path}" for path in EXPECTED_REMOVED_PATHS}
+
+
+@pytest.mark.parametrize(
+    ("line_ending", "terminal_newline"),
+    [(b"\n", True), (b"\r\n", True), (b"\n", False)],
+)
+def test_apply_deletes_only_target_lines_byte_for_byte(
+    tmp_path, line_ending, terminal_newline
+):
+    config_path = tmp_path / "config.yaml"
+    before = BYTE_STABLE_CONFIG.encode("utf-8").replace(b"\n", line_ending)
+    if not terminal_newline:
+        before = before.removesuffix(line_ending)
+    config_path.write_bytes(before)
+
+    target_line_indexes = {
+        index
+        for index, line in enumerate(before.splitlines(keepends=True))
+        if b"# delete target" in line
+    }
+    expected = b"".join(
+        line
+        for index, line in enumerate(before.splitlines(keepends=True))
+        if index not in target_line_indexes
+    )
+
+    assert _migration_module().main(["--config", str(config_path), "--apply"]) == 0
+
+    assert config_path.read_bytes() == expected
+    assert b"unrelated:" + line_ending + b"  card_schema: keep-me" in expected
+
+
+@pytest.mark.parametrize(
+    "target_yaml",
+    [
+        "      card_schema: |\n        2.0\n",
+        "      card_schema:\n        major: 2\n",
+        "      card_schema: [2.0, 1.0]\n",
+        '      card_schema: "2.0\n        continued"\n',
+    ],
+)
+def test_apply_rejects_complex_target_without_changing_file(tmp_path, target_yaml):
+    config_path = tmp_path / "config.yaml"
+    before = (
+        "display:\n"
+        "  platforms:\n"
+        "    feishu:\n"
+        f"{target_yaml}"
+        "      final_response_format: auto\n"
+    ).encode()
+    config_path.write_bytes(before)
+
+    with pytest.raises(ValueError, match="single-line scalar"):
+        _migration_module().main(["--config", str(config_path), "--apply"])
+
+    assert config_path.read_bytes() == before

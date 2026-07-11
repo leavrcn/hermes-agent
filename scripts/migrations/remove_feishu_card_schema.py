@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap
 
 
 FEISHU_CONFIG_ROOTS: tuple[tuple[str, ...], ...] = (
@@ -32,43 +33,164 @@ def _mapping_at(root: Any, path: Sequence[str]) -> MutableMapping[str, Any] | No
     return current if isinstance(current, MutableMapping) else None
 
 
-def _remove_card_schema(
+def _sequence_item_path(path: tuple[str, ...], index: int) -> tuple[str, ...]:
+    return (*path[:-1], f"{path[-1]}[{index}]")
+
+
+def _find_card_schema(
     node: Any,
     path: tuple[str, ...],
-    removed_paths: list[str],
+    found: list[tuple[tuple[str, ...], CommentedMap, Any, int]],
 ) -> None:
-    """Recursively remove ``card_schema`` keys below one Feishu config root."""
-    if isinstance(node, MutableMapping):
-        for key in list(node.keys()):
+    """Locate card_schema keys and their exact source lines in round-trip YAML."""
+    if isinstance(node, CommentedMap):
+        for key in node:
             key_text = str(key)
             child_path = (*path, key_text)
             if key_text == "card_schema":
-                del node[key]
-                removed_paths.append(".".join(child_path))
+                try:
+                    key_line, _ = node.lc.key(key)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Cannot locate source line for {'.'.join(child_path)}"
+                    ) from exc
+                found.append((child_path, node, key, key_line))
             else:
-                _remove_card_schema(node[key], child_path, removed_paths)
+                _find_card_schema(node[key], child_path, found)
     elif isinstance(node, MutableSequence):
         for index, child in enumerate(node):
-            _remove_card_schema(child, (*path[:-1], f"{path[-1]}[{index}]"), removed_paths)
+            _find_card_schema(child, _sequence_item_path(path, index), found)
 
 
-def migrate_config(config_path: Path, *, apply: bool) -> list[str]:
-    """Remove Feishu ``card_schema`` keys and optionally persist the result."""
+def _all_card_schema_values(
+    node: Any,
+    path: tuple[str, ...] = (),
+) -> list[tuple[tuple[str, ...], Any]]:
+    """Return every card_schema path/value pair, including non-Feishu settings."""
+    found: list[tuple[tuple[str, ...], Any]] = []
+    if isinstance(node, Mapping):
+        for key, value in node.items():
+            child_path = (*path, str(key))
+            if str(key) == "card_schema":
+                found.append((child_path, value))
+            found.extend(_all_card_schema_values(value, child_path))
+    elif isinstance(node, MutableSequence):
+        for index, child in enumerate(node):
+            found.extend(_all_card_schema_values(child, _sequence_item_path(path, index)))
+    return found
+
+
+def _is_feishu_path(path: tuple[str, ...]) -> bool:
+    return any(path[: len(root)] == root for root in FEISHU_CONFIG_ROOTS)
+
+
+def _unrelated_card_schema_values(config: Any) -> list[tuple[tuple[str, ...], Any]]:
+    return [entry for entry in _all_card_schema_values(config) if not _is_feishu_path(entry[0])]
+
+
+def _round_trip_load(text: str) -> Any:
     yaml = YAML(typ="rt")
     yaml.preserve_quotes = True
+    return yaml.load(text)
 
-    with config_path.open("r", encoding="utf-8") as stream:
-        config = yaml.load(stream)
 
-    removed_paths: list[str] = []
+def _validate_single_line_scalar(
+    target: tuple[tuple[str, ...], CommentedMap, Any, int],
+    source_lines: list[str],
+) -> None:
+    """Reject targets that cannot safely be removed as one complete source line."""
+    path, parent, key, key_line = target
+    path_text = ".".join(path)
+    value = parent[key]
+    if isinstance(value, (Mapping, MutableSequence)) or getattr(value, "style", None) in {
+        "|",
+        ">",
+    }:
+        raise ValueError(f"{path_text} must be a single-line scalar")
+
+    try:
+        value_line, _ = parent.lc.value(key)
+        source_line = source_lines[key_line]
+    except (IndexError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{path_text} must be a single-line scalar") from exc
+    if value_line != key_line:
+        raise ValueError(f"{path_text} must be a single-line scalar")
+
+    isolated_line = source_line.lstrip(" \t").rstrip("\r\n")
+    try:
+        isolated = _round_trip_load(isolated_line)
+    except Exception as exc:
+        raise ValueError(f"{path_text} must be a single-line scalar") from exc
+    if (
+        not isinstance(isolated, Mapping)
+        or len(isolated) != 1
+        or str(next(iter(isolated))) != "card_schema"
+        or isolated[next(iter(isolated))] != value
+    ):
+        raise ValueError(f"{path_text} must be a single-line scalar")
+
+
+def _find_feishu_targets(config: Any) -> list[tuple[tuple[str, ...], CommentedMap, Any, int]]:
+    targets: list[tuple[tuple[str, ...], CommentedMap, Any, int]] = []
     for root_path in FEISHU_CONFIG_ROOTS:
         feishu_config = _mapping_at(config, root_path)
         if feishu_config is not None:
-            _remove_card_schema(feishu_config, root_path, removed_paths)
+            _find_card_schema(feishu_config, root_path, targets)
+    return targets
 
-    if apply and removed_paths:
-        with config_path.open("w", encoding="utf-8") as stream:
-            yaml.dump(config, stream)
+
+def _verify_migrated_text(
+    text: str,
+    expected_unrelated: list[tuple[tuple[str, ...], Any]],
+) -> None:
+    """Parse with both loaders and verify exact migration scope."""
+    YAML(typ="safe").load(text)
+    config = _round_trip_load(text)
+    remaining_targets = _find_feishu_targets(config)
+    if remaining_targets:
+        paths = ", ".join(".".join(target[0]) for target in remaining_targets)
+        raise ValueError(f"card_schema target paths remain after migration: {paths}")
+    if _unrelated_card_schema_values(config) != expected_unrelated:
+        raise ValueError("non-Feishu card_schema settings changed during migration")
+
+
+def migrate_config(config_path: Path, *, apply: bool) -> list[str]:
+    """Remove Feishu card_schema lines without changing any other file bytes."""
+    original_bytes = config_path.read_bytes()
+    source_text = original_bytes.decode("utf-8")
+    config = _round_trip_load(source_text)
+    targets = _find_feishu_targets(config)
+    source_lines = source_text.splitlines(keepends=True)
+    for target in targets:
+        _validate_single_line_scalar(target, source_lines)
+
+    removed_paths = [".".join(target[0]) for target in targets]
+    if not apply or not targets:
+        return removed_paths
+
+    target_lines = {target[3] for target in targets}
+    if len(target_lines) != len(targets):
+        raise ValueError("each card_schema target must occupy its own single line")
+    migrated_bytes = b"".join(
+        line
+        for index, line in enumerate(original_bytes.splitlines(keepends=True))
+        if index not in target_lines
+    )
+    migrated_text = migrated_bytes.decode("utf-8")
+    expected_unrelated = _unrelated_card_schema_values(config)
+
+    # Validate before writing so unsupported input can never damage the source file.
+    _verify_migrated_text(migrated_text, expected_unrelated)
+    config_path.write_bytes(migrated_bytes)
+    try:
+        written_bytes = config_path.read_bytes()
+        if written_bytes != migrated_bytes:
+            raise ValueError("written configuration differs from validated migration bytes")
+        # Re-parse the actual on-disk result and re-check migration scope.
+        _verify_migrated_text(written_bytes.decode("utf-8"), expected_unrelated)
+    except Exception:
+        config_path.write_bytes(original_bytes)
+        raise
 
     return removed_paths
 
