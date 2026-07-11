@@ -4141,6 +4141,11 @@ class BasePlatformAdapter(ABC):
         if result.success:
             return result
 
+        # If the adapter explicitly reports partial delivery, do NOT retry
+        # or fall back — some content is already visible in the chat.
+        if effective_delivery_state(result) is FinalDeliveryState.PARTIALLY_DELIVERED:
+            return result
+
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
@@ -4173,6 +4178,9 @@ class BasePlatformAdapter(ABC):
                 )
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                    return result
+                # Partial delivery: do not retry or fall back.
+                if effective_delivery_state(result) is FinalDeliveryState.PARTIALLY_DELIVERED:
                     return result
                 error_str = result.error or ""
                 if result.retry_after is not None:
@@ -4883,6 +4891,8 @@ class BasePlatformAdapter(ABC):
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+            else:
+                delivery_succeeded = False
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -5091,9 +5101,14 @@ class BasePlatformAdapter(ABC):
                             exc_info=True,
                         )
                         _rich_result = None
-                    if _rich_result is not None and getattr(_rich_result, "success", False):
-                        _record_delivery(_rich_result)
-                        _rich_final_response_delivered = True
+                    if _rich_result is not None:
+                        _rich_state = effective_delivery_state(_rich_result)
+                        if _rich_state is FinalDeliveryState.FULLY_DELIVERED:
+                            _record_delivery(_rich_result)
+                            _rich_final_response_delivered = True
+                        elif _rich_state is FinalDeliveryState.PARTIALLY_DELIVERED:
+                            _record_delivery(_rich_result)
+                            _rich_final_response_delivered = True
 
                 # Send the text portion
                 if text_content and not _tts_caption_delivered and not _rich_final_response_delivered:
@@ -5129,14 +5144,16 @@ class BasePlatformAdapter(ABC):
                 if images and not _rich_final_response_delivered:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        _img_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(_img_result)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        _record_delivery(SendResult(success=False, error=str(batch_err)))
 
 
                 if _rich_final_response_delivered:
@@ -5175,14 +5192,16 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        _img_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(_img_result)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
+                        _record_delivery(SendResult(success=False, error=str(batch_err)))
 
                 for media_path, is_voice in _non_image_media:
                     if human_delay > 0:
@@ -5207,11 +5226,12 @@ class BasePlatformAdapter(ABC):
                                 file_path=media_path,
                                 metadata=_final_thread_metadata,
                             )
-
+                        _record_delivery(media_result)
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        _record_delivery(SendResult(success=False, error=str(media_err)))
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -5220,19 +5240,21 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            _local_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            _local_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(_local_result)
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        _record_delivery(SendResult(success=False, error=str(file_err)))
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.

@@ -131,6 +131,7 @@ FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    FinalDeliveryState,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
@@ -140,6 +141,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_bytes,
     cache_image_from_bytes,
+    effective_delivery_state,
     iter_media_tag_paths,
 )
 from gateway.platforms.feishu_card_renderer import (
@@ -1973,6 +1975,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         sent_cards = 0
         last_result: Optional[SendResult] = None
+        payloads: list = []
         try:
             image_key_by_source: Dict[str, str] = {}
             for source, image_path, _alt in image_sources:
@@ -2005,11 +2008,21 @@ class FeishuAdapter(BasePlatformAdapter):
                 if not result.success:
                     if sent_cards:
                         logger.warning(
-                            "[Feishu] Final rich card failed after %d card(s); suppressing legacy fallback to avoid duplicate content: %s",
+                            "[Feishu] Final rich card failed after %d card(s); "
+                            "reporting partial delivery: %s",
                             sent_cards,
                             result.error,
                         )
-                        return last_result
+                        return SendResult(
+                            success=False,
+                            error=result.error,
+                            delivery_state=FinalDeliveryState.PARTIALLY_DELIVERED,
+                            raw_response={
+                                "delivered_cards": sent_cards,
+                                "total_cards": len(payloads),
+                                "failed_index": sent_cards,
+                            },
+                        )
                     return None
                 last_result = result
                 sent_cards += 1
@@ -2017,11 +2030,21 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             if sent_cards:
                 logger.warning(
-                    "[Feishu] Final rich card raised after %d card(s); suppressing legacy fallback to avoid duplicate content",
+                    "[Feishu] Final rich card raised after %d card(s); "
+                    "reporting partial delivery",
                     sent_cards,
                     exc_info=True,
                 )
-                return last_result
+                return SendResult(
+                    success=False,
+                    error="Rich card delivery exception after partial send",
+                    delivery_state=FinalDeliveryState.PARTIALLY_DELIVERED,
+                    raw_response={
+                        "delivered_cards": sent_cards,
+                        "total_cards": len(payloads),
+                        "failed_index": sent_cards,
+                    },
+                )
             logger.warning("[Feishu] Final rich card failed; falling back to legacy delivery", exc_info=True)
             return None
 
@@ -2038,13 +2061,15 @@ class FeishuAdapter(BasePlatformAdapter):
 
         content = strip_footer_marker(content)
         if self._should_send_final_response_as_card(content, metadata):
+            payloads: list = []
+            sent_cards = 0
             try:
                 last_result: Optional[SendResult] = None
-                sent_cards = 0
-                for card_payload in build_feishu_card_v2_payloads(
+                payloads = build_feishu_card_v2_payloads(
                     content,
                     table_policy=self._final_response_table_policy(),
-                ):
+                )
+                for card_payload in payloads:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
                         msg_type="interactive",
@@ -2056,11 +2081,21 @@ class FeishuAdapter(BasePlatformAdapter):
                     if not result.success:
                         if sent_cards:
                             logger.warning(
-                                "[Feishu] Final response card failed after %d card(s); not falling back to legacy to avoid duplicate content: %s",
+                                "[Feishu] Final response card failed after %d card(s); "
+                                "reporting partial delivery: %s",
                                 sent_cards,
                                 result.error,
                             )
-                            return result
+                            return SendResult(
+                                success=False,
+                                error=result.error,
+                                delivery_state=FinalDeliveryState.PARTIALLY_DELIVERED,
+                                raw_response={
+                                    "delivered_cards": sent_cards,
+                                    "total_cards": len(payloads),
+                                    "failed_index": sent_cards,
+                                },
+                            )
                         logger.warning("[Feishu] Final response card API failed; falling back to legacy payload: %s", result.error)
                         last_result = None
                         break
@@ -2069,6 +2104,23 @@ class FeishuAdapter(BasePlatformAdapter):
                 if last_result is not None:
                     return last_result
             except Exception as exc:
+                if sent_cards:
+                    logger.warning(
+                        "[Feishu] Final response card send failed after %d card(s); "
+                        "reporting partial delivery: %s",
+                        sent_cards,
+                        exc,
+                    )
+                    return SendResult(
+                        success=False,
+                        error=str(exc),
+                        delivery_state=FinalDeliveryState.PARTIALLY_DELIVERED,
+                        raw_response={
+                            "delivered_cards": sent_cards,
+                            "total_cards": len(payloads),
+                            "failed_index": sent_cards,
+                        },
+                    )
                 logger.warning(
                     "[Feishu] Final response card send failed; falling back to legacy payload: %s",
                     exc,
