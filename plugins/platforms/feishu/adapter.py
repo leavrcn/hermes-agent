@@ -4912,6 +4912,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 reply_in_thread=reply_in_thread,
                 uuid_value=uuid_value,
             )
+            if msg_type == "interactive":
+                _validate_interactive_request_body_size(body)
             request = self._build_reply_message_request(effective_reply_to, body)
             return await self._run_blocking(self._client.im.v1.message.reply, request)
 
@@ -4942,6 +4944,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 content=payload,
                 uuid_value=uuid_value,
             )
+            if msg_type == "interactive":
+                _validate_interactive_request_body_size(body)
             request = self._build_create_message_request(receive_id_type, body)
         return await self._run_blocking(self._client.im.v1.message.create, request)
 

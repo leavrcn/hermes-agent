@@ -1,6 +1,7 @@
 """Tests for UTF-8 byte-safe markdown element splitting in Feishu Card renderer."""
 
 import json
+import re
 
 from gateway.platforms.feishu_card_renderer import build_feishu_card_v2_payloads
 
@@ -40,6 +41,17 @@ def test_split_code_blocks_have_balanced_fences():
     payloads = build_feishu_card_v2_payloads(code)
     for el in _markdown_elements(payloads):
         assert el["content"].count("```") % 2 == 0, "unbalanced fence"
+        assert len(el["content"].encode("utf-8")) <= 3000
+
+
+def test_fenced_multibyte_chunks_include_fence_overhead_in_byte_budget():
+    code = "```python\n" + ("中" * 5000) + "\n```"
+
+    elements = _markdown_elements(build_feishu_card_v2_payloads(code))
+
+    assert len(elements) > 1
+    assert all(len(element["content"].encode("utf-8")) <= 3000 for element in elements)
+    assert all(element["content"].count("```") % 2 == 0 for element in elements)
 
 
 def test_markdown_link_is_not_cut_mid_token():
@@ -57,6 +69,39 @@ def test_markdown_link_is_not_cut_mid_token():
         assert open_count <= close_count, (
             f"Unclosed markdown link: {open_count} ]( vs {close_count} )"
         )
+
+
+def test_single_link_larger_than_budget_is_degraded_without_cutting_link_token():
+    url = "https://example.com/" + ("路径" * 1800)
+    source = f"[完整链接]({url})"
+
+    elements = _markdown_elements(build_feishu_card_v2_payloads(source))
+
+    assert len(elements) > 1
+    assert all(len(element["content"].encode("utf-8")) <= 3000 for element in elements)
+    combined = "".join(element["content"] for element in elements)
+    visible = re.sub(r"\\([\\`*_{}\[\]()#+\-.!|>~])", r"\1", combined)
+    assert source in visible
+    assert all(
+        element["content"].count("](") <= element["content"].count(")")
+        for element in elements
+    )
+
+
+def test_single_inline_code_token_larger_than_budget_is_safely_degraded():
+    source = "`" + ("变量值" * 1800) + "`"
+
+    elements = _markdown_elements(build_feishu_card_v2_payloads(source))
+
+    assert len(elements) > 1
+    assert all(len(element["content"].encode("utf-8")) <= 3000 for element in elements)
+    combined = "".join(element["content"] for element in elements)
+    visible = combined.replace("\\`", "`")
+    assert source in visible
+    assert all(
+        not re.search(r"(?<!\\)`", element["content"])
+        for element in elements
+    )
 
 
 def test_no_empty_chunks():
