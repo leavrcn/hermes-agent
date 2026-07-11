@@ -123,13 +123,64 @@ def _split_table_row(line: str) -> list[str] | None:
     stripped = line.strip()
     if not stripped:
         return None
-    if stripped.startswith("|"):
+    # Track whether outer pipes were present — a single-cell row like
+    # "| content |" is valid only when the pipes wrap the content.
+    had_leading_pipe = stripped.startswith("|")
+    had_trailing_pipe = stripped.endswith("|")
+    if had_leading_pipe:
         stripped = stripped[1:]
-    if stripped.endswith("|"):
+    if had_trailing_pipe:
         stripped = stripped[:-1]
-    cells = [cell.strip() for cell in stripped.split("|")]
-    if len(cells) < 2:
+
+    # Minimal state machine: track backslash-escape and backtick spans
+    # so that \| and `a|b` are not treated as column delimiters.
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    in_backtick = False
+
+    for ch in stripped:
+        if escaped:
+            # Previous char was backslash; this char is literal (including |)
+            current.append(ch)
+            escaped = False
+            continue
+
+        if ch == "\\":
+            escaped = True
+            current.append(ch)
+            continue
+
+        if ch == "`":
+            in_backtick = not in_backtick
+            current.append(ch)
+            continue
+
+        if ch == "|" and not in_backtick:
+            cells.append("".join(current).strip())
+            current = []
+            continue
+
+        current.append(ch)
+
+    # Unclosed backtick → ambiguous; signal failure so caller degrades safely
+    if in_backtick:
         return None
+
+    # Trailing backslash (dangling escape) → ambiguous
+    if escaped:
+        return None
+
+    cells.append("".join(current).strip())
+
+    # A pipe-wrapped row "| content |" may have just one cell.
+    # A bare row without outer pipes needs at least 2 cells to be a table row.
+    if had_leading_pipe and had_trailing_pipe:
+        if len(cells) < 1:
+            return None
+    else:
+        if len(cells) < 2:
+            return None
     return cells
 
 
