@@ -1851,6 +1851,21 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
         return
 
 
+class FinalDeliveryState(str, Enum):
+    """Explicit tri-state delivery contract.
+
+    ``NOT_HANDLED``
+        Zero content visible; safe to fall back.
+    ``FULLY_DELIVERED``
+        All content has been delivered.
+    ``PARTIALLY_DELIVERED``
+        Some content is already visible; must NOT re-send the full payload.
+    """
+    NOT_HANDLED = "not_handled"
+    FULLY_DELIVERED = "fully_delivered"
+    PARTIALLY_DELIVERED = "partially_delivered"
+
+
 @dataclass
 class SendResult:
     """Result of sending a message."""
@@ -1883,6 +1898,34 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+    # Explicit tri-state delivery contract (D1).  When set, this overrides the
+    # legacy success/failure binary for downstream fallback decisions.
+    # PARTIALLY_DELIVERED must always pair with success=False (enforced in
+    # __post_init__).  Defaults to None for backward compatibility — legacy
+    # callers that don't set it are handled by effective_delivery_state().
+    delivery_state: Optional[FinalDeliveryState] = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.delivery_state is FinalDeliveryState.PARTIALLY_DELIVERED
+            and self.success
+        ):
+            raise ValueError(
+                "SendResult with PARTIALLY_DELIVERED delivery_state must have "
+                "success=False to avoid reporting partial delivery as success."
+            )
+
+
+def effective_delivery_state(result: SendResult) -> FinalDeliveryState:
+    """Return the effective delivery state, inferring from legacy fields when
+    ``delivery_state`` is not explicitly set."""
+    if result.delivery_state is not None:
+        return result.delivery_state
+    return (
+        FinalDeliveryState.FULLY_DELIVERED
+        if result.success
+        else FinalDeliveryState.NOT_HANDLED
+    )
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
