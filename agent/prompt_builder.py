@@ -795,7 +795,8 @@ PLATFORM_HINTS = {
         "handcraft Card JSON. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.jpg, .png, .webp) are uploaded and displayed "
-        "inline, audio files as voice messages, and other files as attachments."
+        "inline. Supported OGG/Opus audio can be sent as voice messages; other "
+        "audio formats and files are delivered as attachments."
     ),
     "weixin": (
         "You are on Weixin/WeChat. Markdown formatting is supported, so you may use it when "

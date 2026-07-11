@@ -1124,6 +1124,10 @@ class TestPromptBuilderConstants:
         assert "Card" in hint
         assert "Card JSON" in hint
         assert "do not" in hint.lower()
+        assert "OGG/Opus" in hint
+        assert "other audio formats" in hint
+        assert "attachments" in hint
+        assert "audio files as voice messages" not in hint
         assert "bold, italic, code blocks, and links are supported" not in hint
 
     def test_platform_hints_webui(self):
