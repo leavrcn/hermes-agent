@@ -283,34 +283,229 @@ def _split_oversized_markdown_element(
     element: dict[str, Any],
     max_markdown_chars: int,
 ) -> list[dict[str, Any]]:
+    """Split an oversized markdown element by UTF-8 byte budget.
+
+    - Uses ``len(content.encode("utf-8"))`` for the size check.
+    - Prefers splitting at line boundaries (``\\n``).
+    - When no line boundary is available within the budget, splits at a
+      UTF-8 character-safe position (never mid-multibyte).
+    - Avoids splitting inside ``[...](...)`` links, `` `...` `` inline code,
+      or backslash escape sequences.
+    - When the content contains an open code fence (````​```​````), each
+      split piece gets a closing fence and the next piece re-opens it.
+    - Never produces empty chunks.
+    """
     if element.get("tag") != "markdown":
         return [element]
     content = str(element.get("content") or "")
-    if len(content) <= max_markdown_chars:
+    if len(content.encode("utf-8")) <= max_markdown_chars:
         return [element]
-    parts = _split_text_preserving_words(content, max_markdown_chars)
-    return [{**element, "content": part} for part in parts]
+    parts = _split_markdown_by_utf8_bytes(content, max_markdown_chars)
+    return [{**element, "content": part} for part in parts if part]
 
 
-def _split_text_preserving_words(text: str, limit: int) -> list[str]:
-    if limit <= 0 or len(text) <= limit:
-        return [text]
-    parts: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        window = remaining[:limit]
-        split_at = max(window.rfind("\n\n"), window.rfind("\n"), window.rfind("。"), window.rfind(" "))
-        if split_at < max(80, limit // 3):
-            split_at = limit
+def _utf8_safe_rsplit(text: str, max_bytes: int) -> tuple[str, str]:
+    """Split *text* so that the left part is at most *max_bytes* in UTF-8.
+
+    The split point is chosen at a character boundary (never mid-multibyte).
+    Returns ``(left, right)``.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, ""
+    # Find the largest char-boundary whose UTF-8 encoding fits in max_bytes.
+    # We do this by walking back from max_bytes until we find a valid boundary.
+    cut = max_bytes
+    # A valid UTF-8 char boundary: the byte at *cut* must be a leading byte
+    # (not a continuation byte 0x80-0xBF).
+    while cut > 0 and (encoded[cut] & 0xC0) == 0x80:
+        cut -= 1
+    # Now *cut* is a character boundary.  But we may have cut too aggressively
+    # for the first round; the caller will handle remaining.
+    left = encoded[:cut].decode("utf-8")
+    right = encoded[cut:].decode("utf-8")
+    return left, right
+
+
+def _find_safe_split_point(text: str, max_bytes: int) -> int:
+    """Find a character index to split *text* so that ``text[:idx]`` fits
+    within *max_bytes* in UTF-8, preferring boundaries at ``\\n``, spaces,
+    and sentence terminators.  Avoids cutting inside links, inline code,
+    or escape sequences.
+
+    Returns a character index (0-based), not byte offset.
+    """
+    # First, find the byte-safe maximum character length.
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return len(text)
+
+    # Binary search for the maximum number of characters whose UTF-8
+    # encoding fits within max_bytes.
+    lo, hi = 0, len(text)
+    best = 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if len(text[:mid].encode("utf-8")) <= max_bytes:
+            best = mid
+            lo = mid + 1
         else:
-            split_at += 1
-        part = remaining[:split_at].strip()
-        if part:
+            hi = mid - 1
+
+    if best == 0:
+        # Even one character fits (shouldn't happen with reasonable budgets),
+        # but guard anyway.
+        return 1
+
+    # Now try to find a better boundary within text[:best].
+    window = text[:best]
+    # Prefer: double newline > newline > 。 > space > hard cut
+    candidates = [
+        window.rfind("\n\n"),
+        window.rfind("\n"),
+        window.rfind("。"),
+        window.rfind(" "),
+    ]
+    split_at = max(candidates)
+    if split_at < max(40, best // 4):
+        # No good boundary found — use the hard character-boundary cut.
+        split_at = best
+    else:
+        split_at += 1  # include the boundary character
+
+    # Avoid cutting inside markdown links [text](url), inline code `...`,
+    # or backslash escapes.
+    split_at = _avoid_unsafe_markdown_cut(text, split_at, best)
+
+    return split_at
+
+
+def _avoid_unsafe_markdown_cut(text: str, split_at: int, hard_limit: int) -> int:
+    """Adjust *split_at* to avoid breaking markdown link/inline-code/escape
+    syntax.  If the split point falls inside an unsafe region, move it
+    backwards to just before the unsafe region begins.
+    """
+    if split_at <= 0 or split_at >= len(text):
+        return split_at
+
+    # Check for backslash escape: if the character before split_at is a
+    # backslash, move back.
+    while split_at > 0 and text[split_at - 1] == "\\":
+        split_at -= 1
+
+    # Check for unclosed inline code: count backticks in text[:split_at].
+    # If odd, the split is inside an inline code span — move back to
+    # before the last opening backtick.
+    prefix = text[:split_at]
+    backtick_count = prefix.count("`")
+    # But we need to be careful: ``` could be a code fence, not inline code.
+    # Only treat single or double backticks as inline code.
+    triple_count = prefix.count("```")
+    single_backticks = backtick_count - triple_count * 3
+    if single_backticks % 2 == 1:
+        # Inside inline code — find the last lone backtick and move before it.
+        idx = prefix.rfind("`")
+        if idx >= 0:
+            split_at = idx
+
+    # Check for unclosed markdown link: look for `](` in the prefix
+    # without a matching `)` after it.
+    last_link_open = prefix.rfind("](")
+    if last_link_open >= 0:
+        after_open = prefix[last_link_open + 2:]
+        if ")" not in after_open:
+            # The link URL is being cut — move split before the `[`.
+            # Find the matching `[` for this `]`.
+            bracket_start = prefix.rfind("[", 0, last_link_open)
+            if bracket_start >= 0:
+                split_at = bracket_start
+
+    # Final guard: don't let the adjustment push below 0 or above hard_limit.
+    if split_at <= 0:
+        return min(1, hard_limit)
+    return min(split_at, hard_limit)
+
+
+def _split_markdown_by_utf8_bytes(content: str, max_bytes: int) -> list[str]:
+    """Split *content* into pieces, each at most *max_bytes* in UTF-8.
+
+    Handles code fences: detects open ````​```lang```` fences and ensures
+    each split piece has balanced fences.
+    """
+    parts: list[str] = []
+    remaining = content
+
+    while len(remaining.encode("utf-8")) > max_bytes:
+        # Detect code fence state in the remaining text.
+        fence_lang = _detect_open_code_fence(remaining)
+
+        # Find a safe split point.
+        split_at = _find_safe_split_point(remaining, max_bytes)
+
+        if split_at <= 0:
+            # Safety valve: force at least 1 character.
+            split_at = 1
+
+        part = remaining[:split_at]
+        rest = remaining[split_at:]
+
+        # Handle code fence balance.
+        if fence_lang is not None:
+            # The part starts inside a code block. Close it.
+            part = part.rstrip("\n")
+            if not part.endswith("```"):
+                part += "\n```"
             parts.append(part)
-        remaining = remaining[split_at:].strip()
-    if remaining:
+            # Re-open the fence in the next part.
+            rest = rest.lstrip("\n")
+            rest = f"```{fence_lang}\n" + rest
+        else:
+            # Check if this part has an odd number of ``` — meaning
+            # we opened a fence but didn't close it.
+            fence_count = part.count("```")
+            if fence_count % 2 == 1:
+                # Extract the fence language.
+                fence_match = re.search(r"```(\w*)", part)
+                lang = fence_match.group(1) if fence_match else ""
+                part = part.rstrip("\n")
+                if not part.endswith("```"):
+                    part += "\n```"
+                parts.append(part)
+                rest = rest.lstrip("\n")
+                rest = f"```{lang}\n" + rest
+            else:
+                stripped = part.strip()
+                if stripped:
+                    parts.append(part)
+
+        remaining = rest
+
+    # Last chunk.
+    if remaining.strip():
         parts.append(remaining)
+
     return parts
+
+
+def _detect_open_code_fence(text: str) -> str | None:
+    """If *text* starts inside a code fence (i.e., the text begins with
+    the interior of a code block because a previous fence was opened but
+    not closed), return the language tag.  Otherwise return None.
+
+    This is used when we've already split off a piece that re-opened a fence.
+    """
+    # Count ``` occurrences: if odd, the text starts inside a code block.
+    fence_count = text.count("```")
+    if fence_count % 2 == 1:
+        # The first ``` in the text closes the open block.
+        # We want to know the language of the *opening* fence that was
+        # placed by the previous split.  We handle this differently:
+        # if text starts with "```lang\n", it's the re-opened fence.
+        m = re.match(r"```(\w*)\n", text)
+        if m:
+            return m.group(1)
+        return ""
+    return None
 
 
 def _partition_elements(
