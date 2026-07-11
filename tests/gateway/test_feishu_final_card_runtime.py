@@ -413,6 +413,7 @@ async def test_feishu_interactive_thread_metadata_creates_in_parent_chat_without
         payload=json.dumps({"schema": "2.0", "body": {"elements": []}}),
         reply_to=None,
         metadata={"thread_id": "omt_thread", "hermes_final_response": True},
+        uuid_value="test-interactive-uuid",
     )
 
     assert response.success()
