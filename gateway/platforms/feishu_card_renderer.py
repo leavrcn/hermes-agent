@@ -40,6 +40,17 @@ class FeishuCardRenderingError(ValueError):
     """Raised when a card cannot be represented within Feishu's hard limits."""
 
 
+def _require_single_card(
+    cards: list[dict[str, Any]], *, entrypoint: str
+) -> dict[str, Any]:
+    if len(cards) != 1:
+        raise FeishuCardRenderingError(
+            f"{entrypoint} requires multiple cards ({len(cards)}); "
+            "use the plural Feishu card builder"
+        )
+    return cards[0]
+
+
 def render_document_to_feishu_card_v2(
     doc: MessageDocument,
     *,
@@ -51,9 +62,15 @@ def render_document_to_feishu_card_v2(
     max_rows: int = 20,
     image_key_by_source: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Convert a ``MessageDocument`` into a single Feishu Card JSON 2.0 dict."""
-    elements = _document_to_elements(
+    """Convert a document into exactly one hard-limit-compliant Card v2 dict.
+
+    Callers that can deliver multiple cards must use
+    :func:`render_document_to_feishu_card_v2_parts`; this singular entry point
+    fails explicitly rather than returning an oversized payload.
+    """
+    cards = render_document_to_feishu_card_v2_parts(
         doc,
+        title=title,
         table_policy=table_policy,
         table_cell_type=table_cell_type,
         max_tables=max_tables,
@@ -61,7 +78,7 @@ def render_document_to_feishu_card_v2(
         max_rows=max_rows,
         image_key_by_source=image_key_by_source,
     )
-    return _build_card_payload(doc.blocks, elements, title=title)
+    return _require_single_card(cards, entrypoint="singular Feishu card renderer")
 
 
 def render_document_to_feishu_card_v2_parts(
@@ -93,7 +110,9 @@ def render_document_to_feishu_card_v2_parts(
         )
     effective_title = title
     title_elements: list[dict[str, Any]] = []
-    if len(title.encode("utf-8")) > _MAX_INLINE_PLAIN_TEXT_BYTES:
+    if len((title + _NUMBERING_TITLE_RESERVE).encode("utf-8")) > (
+        _MAX_INLINE_PLAIN_TEXT_BYTES
+    ):
         effective_title = _FIXED_CARD_TITLE
         title_elements.append(
             {"tag": "markdown", "content": title, "text_size": "heading"}
@@ -151,6 +170,13 @@ def render_document_to_feishu_card_v2_parts(
             card["header"]["title"]["content"] = f"{effective_title} {idx}/{total}"
 
     for index, card in enumerate(cards, start=1):
+        final_title = str(card["header"]["title"].get("content") or "")
+        final_title_bytes = len(final_title.encode("utf-8"))
+        if final_title_bytes > _MAX_INLINE_PLAIN_TEXT_BYTES:
+            raise FeishuCardRenderingError(
+                f"final plain_text title is {final_title_bytes} UTF-8 bytes; "
+                f"limit is {_MAX_INLINE_PLAIN_TEXT_BYTES}"
+            )
         if not _serialized_card_fits_limits(card, card_budget):
             raise FeishuCardRenderingError(
                 f"final numbered Feishu card {index}/{len(cards)} exceeds hard limits: "
@@ -504,6 +530,34 @@ def _degrade_oversized_markdown_atoms(text: str, max_bytes: int) -> str:
     return "".join(chunks)
 
 
+def _degrade_oversized_fence_openers(text: str, max_bytes: int) -> str:
+    """Escape a fenced block whose complete opener cannot fit atomically.
+
+    Fence opener lines are indivisible: cutting one creates a partial language
+    string that can be reinserted indefinitely when the splitter reopens the
+    fence. Escaping backticks across that block turns it into pageable visible
+    plain source while preserving every source character after unescaping.
+    """
+    lines = text.splitlines(keepends=True)
+    degraded: list[str] = []
+    escaping_block = False
+
+    for line in lines:
+        stripped = line.rstrip("\r\n").strip()
+        if not escaping_block:
+            is_opener = re.fullmatch(r"```[^`]*", stripped) is not None
+            if is_opener and len(line.encode("utf-8")) > max_bytes:
+                escaping_block = True
+        if escaping_block:
+            degraded.append(line.replace("`", "\\`"))
+            if stripped == "```":
+                escaping_block = False
+        else:
+            degraded.append(line)
+
+    return "".join(degraded)
+
+
 def _find_safe_split_point(text: str, max_bytes: int) -> int:
     """Return a UTF-8-safe character boundary outside Markdown atoms."""
     if max_bytes <= 0:
@@ -574,10 +628,12 @@ def _split_markdown_by_utf8_bytes(content: str, max_bytes: int) -> list[str]:
         raise FeishuCardRenderingError(
             f"markdown byte budget {max_bytes} is too small for safe splitting"
         )
-    remaining = _degrade_oversized_markdown_atoms(content, max_bytes)
+    remaining = _degrade_oversized_fence_openers(content, max_bytes)
+    remaining = _degrade_oversized_markdown_atoms(remaining, max_bytes)
     parts: list[str] = []
 
     while len(remaining.encode("utf-8")) > max_bytes:
+        previous_remaining_bytes = len(remaining.encode("utf-8"))
         split_at = _find_safe_split_point(remaining, max_bytes)
         if split_at <= 0:
             raise FeishuCardRenderingError(
@@ -609,6 +665,12 @@ def _split_markdown_by_utf8_bytes(content: str, max_bytes: int) -> list[str]:
             raise FeishuCardRenderingError(
                 f"markdown splitter produced {len(part.encode('utf-8'))} bytes "
                 f"for a {max_bytes}-byte budget"
+            )
+        next_remaining_bytes = len(rest.encode("utf-8"))
+        if next_remaining_bytes >= previous_remaining_bytes:
+            raise FeishuCardRenderingError(
+                "markdown splitter made no UTF-8 byte progress: "
+                f"remaining={previous_remaining_bytes}, next={next_remaining_bytes}"
             )
         parts.append(part)
         remaining = rest

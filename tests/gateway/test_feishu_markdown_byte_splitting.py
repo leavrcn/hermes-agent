@@ -2,7 +2,13 @@
 
 import json
 import re
+import subprocess
+import sys
+import textwrap
 
+import pytest
+
+import gateway.platforms.feishu_card_renderer as renderer
 from gateway.platforms.feishu_card_renderer import build_feishu_card_v2_payloads
 
 
@@ -52,6 +58,57 @@ def test_fenced_multibyte_chunks_include_fence_overhead_in_byte_budget():
     assert len(elements) > 1
     assert all(len(element["content"].encode("utf-8")) <= 3000 for element in elements)
     assert all(element["content"].count("```") % 2 == 0 for element in elements)
+
+
+def test_public_pipeline_degrades_oversized_fence_opener_losslessly_with_timeout():
+    """An oversized info string must terminate and remain visible losslessly."""
+    script = textwrap.dedent(
+        r'''
+        import json
+
+        from gateway.platforms.feishu_card_renderer import build_feishu_card_v2_payloads
+
+        source = "```" + ("lang" * 1000) + "\nBODY\n```"
+        payloads = build_feishu_card_v2_payloads(source)
+        chunks = [
+            element["content"]
+            for payload in payloads
+            for element in json.loads(payload)["body"]["elements"]
+            if element.get("tag") == "markdown"
+        ]
+        assert chunks
+        assert all(len(chunk.encode("utf-8")) <= 3000 for chunk in chunks)
+        assert "".join(chunks).replace("\\`", "`") == source
+        print(json.dumps({"chunks": len(chunks)}))
+        '''
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert json.loads(completed.stdout)["chunks"] >= 2
+
+
+def test_splitter_raises_if_a_round_does_not_reduce_remaining_utf8_bytes(monkeypatch):
+    calls = 0
+
+    def fake_open_fence_language(_text):
+        nonlocal calls
+        calls += 1
+        if calls > 2:
+            raise AssertionError("splitter started another non-progressing round")
+        return "x" * 4000
+
+    monkeypatch.setattr(renderer, "_open_fence_language", fake_open_fence_language)
+
+    with pytest.raises(renderer.FeishuCardRenderingError, match="made no UTF-8 byte progress"):
+        renderer._split_markdown_by_utf8_bytes("a" * 4000, 3000)
 
 
 def test_markdown_link_is_not_cut_mid_token():

@@ -12,10 +12,14 @@ import pytest
 
 from gateway.platforms.feishu_card_renderer import (
     _DEFAULT_MAX_CARD_BYTES,
+    FeishuCardRenderingError,
     _check_serialized_card_size,
     _paginate_table_element,
+    build_feishu_card_v2_payload,
+    build_feishu_card_v2_payload_from_document,
     build_feishu_card_v2_payloads,
     build_feishu_card_v2_payloads_from_document,
+    render_document_to_feishu_card_v2,
     render_document_to_feishu_card_v2_parts,
 )
 from gateway.rendering.document import (
@@ -452,3 +456,36 @@ class TestFullPipelineByteLimit:
             card["header"]["title"]["content"].endswith(f"/{len(cards)}")
             for card in cards
         )
+
+    def test_1024_byte_title_moves_to_body_before_multicard_numbering(self):
+        title = "title:" + ("T" * (1024 - len("title:")))
+        doc = MessageDocument([ParagraphBlock(text="正文" * 12000)])
+
+        cards = render_document_to_feishu_card_v2_parts(doc, title=title)
+
+        assert len(cards) > 1
+        assert all(
+            len(card["header"]["title"]["content"].encode("utf-8")) <= 1024
+            for card in cards
+        )
+        assert all(
+            card["header"]["title"]["content"].startswith("Hermes ")
+            for card in cards
+        )
+        body_markdown = "".join(
+            element["content"]
+            for element in _all_elements(cards)
+            if element.get("tag") == "markdown"
+        )
+        assert body_markdown.count(title) == 1
+
+    def test_singular_public_builders_reject_content_that_requires_multiple_cards(self):
+        text = "x" * 50000
+        doc = MessageDocument([ParagraphBlock(text=text)])
+
+        with pytest.raises(FeishuCardRenderingError, match="requires multiple cards"):
+            build_feishu_card_v2_payload(text)
+        with pytest.raises(FeishuCardRenderingError, match="requires multiple cards"):
+            build_feishu_card_v2_payload_from_document(doc)
+        with pytest.raises(FeishuCardRenderingError, match="requires multiple cards"):
+            render_document_to_feishu_card_v2(doc)
