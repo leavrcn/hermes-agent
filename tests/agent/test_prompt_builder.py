@@ -1119,7 +1119,12 @@ class TestPromptBuilderConstants:
         hint = PLATFORM_HINTS["feishu"]
         assert "Feishu" in hint
         assert "MEDIA:" in hint
-        assert "Markdown" in hint
+        assert "limited Markdown" in hint
+        assert "Gateway" in hint
+        assert "Card" in hint
+        assert "Card JSON" in hint
+        assert "do not" in hint.lower()
+        assert "bold, italic, code blocks, and links are supported" not in hint
 
     def test_platform_hints_webui(self):
         hint = PLATFORM_HINTS["webui"]

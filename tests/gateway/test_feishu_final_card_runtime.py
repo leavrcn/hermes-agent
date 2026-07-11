@@ -59,7 +59,6 @@ def _make_adapter(*, final_response_format="card", markdown_tables="table") -> F
         extra={
             "final_response_format": final_response_format,
             "markdown_tables": markdown_tables,
-            "card_schema": "2.0",
         },
     )
     adapter = FeishuAdapter(cfg)
@@ -437,8 +436,7 @@ def test_gateway_platforms_feishu_extra_loads_final_card_settings(tmp_path, monk
         "  feishu:\n"
         "    extra:\n"
         "      final_response_format: auto\n"
-        "      markdown_tables: table\n"
-        "      card_schema: '2.0'\n",
+        "      markdown_tables: table\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -448,7 +446,6 @@ def test_gateway_platforms_feishu_extra_loads_final_card_settings(tmp_path, monk
     extra = cfg.platforms[Platform.FEISHU].extra
     assert extra["final_response_format"] == "auto"
     assert extra["markdown_tables"] == "table"
-    assert extra["card_schema"] == "2.0"
 
 
 def test_nested_gateway_platforms_feishu_extra_loads_final_card_settings(tmp_path, monkeypatch):
