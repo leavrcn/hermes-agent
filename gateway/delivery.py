@@ -472,6 +472,15 @@ class DeliveryRouter:
             }
 
         send_metadata = dict(metadata or {})
+        # Map delivery_purpose to platform-specific final-response marker.
+        # Callers (cron, handoff) set the semantic field
+        # ``delivery_purpose="assistant_final"``; the router translates it
+        # to the Feishu-specific ``hermes_final_response=True`` marker so
+        # the adapter can emit a final-response card.  Other purposes
+        # (notice, progress, typing) are left untouched.
+        if send_metadata.get("delivery_purpose") == "assistant_final":
+            if target.platform == Platform.FEISHU:
+                send_metadata["hermes_final_response"] = True
         is_named_telegram_private_topic = False
         named_telegram_private_topic_name: Optional[str] = None
         if target.thread_id:

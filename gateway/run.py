@@ -7619,7 +7619,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Send the agent's reply to the destination. Route to the new
         # thread if we created one; otherwise the configured home channel
         # (which may itself carry a thread_id).
-        send_metadata: Dict[str, Any] = {}
+        send_metadata: Dict[str, Any] = {"delivery_purpose": "assistant_final"}
         if effective_thread_id:
             send_metadata["thread_id"] = effective_thread_id
         try:
