@@ -18,8 +18,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 
 
 def _run(coro):
@@ -260,6 +260,28 @@ class TestDiscordMultiImage:
         sizes = [len(c.kwargs["files"]) for c in mock_channel.send.await_args_list]
         assert sizes == [10, 5]
 
+    def test_partial_local_file_skip_returns_failure(self, adapter, tmp_path):
+        """A native chunk send cannot hide an image skipped during preparation."""
+        present = tmp_path / "present.png"
+        present.write_bytes(b"\x89PNG" + b"\x00" * 20)
+        missing = tmp_path / "missing.png"
+        mock_channel = MagicMock()
+        mock_channel.send = AsyncMock(return_value=MagicMock(id=1))
+        adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        adapter._is_forum_parent = MagicMock(return_value=False)
+
+        result = _run(
+            adapter.send_multiple_images(
+                "67890",
+                [(f"file://{present}", "present"), (f"file://{missing}", "missing")],
+            )
+        )
+
+        mock_channel.send.assert_awaited_once()
+        assert len(mock_channel.send.call_args.kwargs["files"]) == 1
+        assert result.success is False
+        assert "Skipped 1 image" in (result.error or "")
+
     def test_empty_noop(self, adapter):
         adapter._client = MagicMock()
         _run(adapter.send_multiple_images("67890", []))
@@ -352,6 +374,7 @@ class TestMattermostMultiImage:
         config = PlatformConfig(enabled=True, token="fake")
         # Minimal construction via object.__new__ to avoid full setup
         a = object.__new__(MattermostAdapter)
+        a.platform = Platform.MATTERMOST
         a._base_url = "https://mm.example.com"
         a._token = "fake"
         a._session = MagicMock()
@@ -392,6 +415,80 @@ class TestMattermostMultiImage:
         sizes = [len(c.args[1]["file_ids"]) for c in adapter._api_post.await_args_list]
         assert sizes == [5, 2]
 
+    def test_fallback_success_recovers_native_partial_skip_and_post_failure(
+        self, adapter, tmp_path
+    ):
+        """A full original-chunk fallback replaces stale native preparation errors."""
+        present = tmp_path / "present.png"
+        present.write_bytes(b"\x89PNG" + b"\x00" * 20)
+        missing = tmp_path / "missing.png"
+        adapter._api_post = AsyncMock(return_value=None)
+        adapter.send_image_file = AsyncMock(
+            side_effect=[
+                SendResult(success=True, message_id="fallback-1"),
+                SendResult(success=True, message_id="fallback-2"),
+            ]
+        )
+
+        result = _run(
+            adapter.send_multiple_images(
+                "channel123",
+                [(f"file://{present}", "present"), (f"file://{missing}", "missing")],
+            )
+        )
+
+        assert adapter.send_image_file.await_count == 2
+        assert [
+            call.kwargs["image_path"]
+            for call in adapter.send_image_file.await_args_list
+        ] == [str(present), str(missing)]
+        assert result.success is True
+        assert result.error is None
+
+    def test_fallback_partial_failure_after_native_post_failure_stays_failure(
+        self, adapter, tmp_path
+    ):
+        """Fallback recovery succeeds only when every original image is delivered."""
+        present = tmp_path / "present.png"
+        present.write_bytes(b"\x89PNG" + b"\x00" * 20)
+        missing = tmp_path / "missing.png"
+        adapter._api_post = AsyncMock(return_value=None)
+        adapter.send_image_file = AsyncMock(
+            side_effect=[
+                SendResult(success=True, message_id="fallback-1"),
+                SendResult(success=False, error="fallback rejected"),
+            ]
+        )
+
+        result = _run(
+            adapter.send_multiple_images(
+                "channel123",
+                [(f"file://{present}", "present"), (f"file://{missing}", "missing")],
+            )
+        )
+
+        assert adapter.send_image_file.await_count == 2
+        assert result.success is False
+        assert "fallback rejected" in (result.error or "")
+        assert "Skipped" not in (result.error or "")
+
+    def test_native_partial_success_keeps_unsent_image_failure(self, adapter, tmp_path):
+        """A successful native post remains failed when preparation skipped an image."""
+        present = tmp_path / "present.png"
+        present.write_bytes(b"\x89PNG" + b"\x00" * 20)
+        missing = tmp_path / "missing.png"
+
+        result = _run(
+            adapter.send_multiple_images(
+                "channel123",
+                [(f"file://{present}", "present"), (f"file://{missing}", "missing")],
+            )
+        )
+
+        adapter._api_post.assert_awaited_once()
+        assert result.success is False
+        assert "Skipped 1 image" in (result.error or "")
+
     def test_empty_noop(self, adapter):
         _run(adapter.send_multiple_images("channel123", []))
         adapter._api_post.assert_not_called()
@@ -427,15 +524,18 @@ class TestEmailMultiImage:
         images = [(f"file://{p}", f"alt {i}") for i, p in enumerate(paths)]
 
         with patch.object(
-            adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
+            adapter,
+            "_send_email_with_attachments",
+            MagicMock(return_value=("<msgid@x>", [])),
         ) as mock_send:
-            _run(adapter.send_multiple_images("user@example.com", images))
+            result = _run(adapter.send_multiple_images("user@example.com", images))
 
         mock_send.assert_called_once()
         to_addr, body, file_paths = mock_send.call_args.args
         assert to_addr == "user@example.com"
         assert len(file_paths) == 3
         assert "alt 0" in body
+        assert result.success is True
 
     def test_remote_urls_linked_in_body(self, adapter, tmp_path):
         """Remote URL images get their URL appended to the body, no attachment."""
@@ -444,7 +544,9 @@ class TestEmailMultiImage:
             ("https://x.com/b.png", "second"),
         ]
         with patch.object(
-            adapter, "_send_email_with_attachments", MagicMock(return_value="<msgid@x>")
+            adapter,
+            "_send_email_with_attachments",
+            MagicMock(return_value=("<msgid@x>", [])),
         ) as mock_send:
             _run(adapter.send_multiple_images("user@example.com", images))
 
@@ -453,6 +555,24 @@ class TestEmailMultiImage:
         assert file_paths == []
         assert "https://x.com/a.png" in body
         assert "https://x.com/b.png" in body
+
+    def test_attachment_read_failure_returns_failure(self, adapter, tmp_path):
+        """A file that exists but cannot be read must not be reported as attached."""
+        image = tmp_path / "image.png"
+        image.write_bytes(b"\x89PNG")
+        smtp = MagicMock()
+        adapter._connect_smtp = MagicMock(return_value=smtp)
+
+        with patch("builtins.open", side_effect=OSError("read denied")):
+            result = _run(
+                adapter.send_multiple_images(
+                    "user@example.com", [(f"file://{image}", "image")]
+                )
+            )
+
+        smtp.send_message.assert_called_once()
+        assert result.success is False
+        assert "read denied" in (result.error or "")
 
     def test_empty_noop(self, adapter):
         with patch.object(

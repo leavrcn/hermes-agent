@@ -5099,6 +5099,7 @@ class BasePlatformAdapter(ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )

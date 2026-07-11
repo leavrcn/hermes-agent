@@ -664,14 +664,14 @@ class MattermostAdapter(BasePlatformAdapter):
                     if fid:
                         file_ids.append(fid)
 
-                if len(file_ids) != len(chunk):
+                skipped_count = len(chunk) - len(file_ids)
+                if not file_ids:
                     results.append(
                         SendResult(
                             success=False,
-                            error=f"Skipped {len(chunk) - len(file_ids)} image(s) in Mattermost batch",
+                            error=f"Skipped {skipped_count} image(s) in Mattermost batch",
                         )
                     )
-                if not file_ids:
                     continue
 
                 payload: Dict[str, Any] = {
@@ -695,6 +695,13 @@ class MattermostAdapter(BasePlatformAdapter):
                         )
                     )
                 else:
+                    if skipped_count:
+                        results.append(
+                            SendResult(
+                                success=False,
+                                error=f"Skipped {skipped_count} image(s) in Mattermost batch",
+                            )
+                        )
                     results.append(
                         SendResult(success=True, message_id=str(data["id"]), raw_response=data)
                     )

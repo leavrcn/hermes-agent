@@ -1025,17 +1025,18 @@ class EmailAdapter(BasePlatformAdapter):
 
         try:
             loop = asyncio.get_running_loop()
-            message_id = await loop.run_in_executor(
+            message_id, attachment_errors = await loop.run_in_executor(
                 None,
                 self._send_email_with_attachments,
                 chat_id,
                 body,
                 local_paths,
             )
+            all_errors = errors + attachment_errors
             return SendResult(
-                success=not errors,
+                success=not all_errors,
                 message_id=message_id,
-                error="; ".join(errors) if errors else None,
+                error="; ".join(all_errors) if all_errors else None,
             )
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
@@ -1046,8 +1047,8 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         file_paths: List[str],
-    ) -> str:
-        """Send an email with multiple file attachments via SMTP."""
+    ) -> Tuple[str, List[str]]:
+        """Send an email and report any attachments that could not be read."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
@@ -1070,6 +1071,7 @@ class EmailAdapter(BasePlatformAdapter):
         if body:
             msg.attach(MIMEText(body, "plain", "utf-8"))
 
+        attachment_errors: List[str] = []
         for file_path in file_paths:
             p = Path(file_path)
             try:
@@ -1080,7 +1082,9 @@ class EmailAdapter(BasePlatformAdapter):
                     part.add_header("Content-Disposition", f"attachment; filename={p.name}")
                     msg.attach(part)
             except Exception as e:
-                logger.warning("[Email] Failed to attach %s: %s", file_path, e)
+                error = f"Failed to attach {file_path}: {e}"
+                attachment_errors.append(error)
+                logger.warning("[Email] %s", error)
 
         smtp = self._connect_smtp()
         try:
@@ -1092,8 +1096,13 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception:
                 smtp.close()
 
-        logger.info("[Email] Sent multi-attachment email to %s (%d files)", to_addr, len(file_paths))
-        return msg_id
+        logger.info(
+            "[Email] Sent multi-attachment email to %s (%d/%d files)",
+            to_addr,
+            len(file_paths) - len(attachment_errors),
+            len(file_paths),
+        )
+        return msg_id, attachment_errors
 
     async def send_document(
         self,

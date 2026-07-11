@@ -4,6 +4,7 @@ Verifies that failed attachments (images, voice, video, document) are
 recorded via _record_delivery() and affect ProcessingOutcome.
 """
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -48,7 +49,7 @@ class _AccountableAdapter(BasePlatformAdapter):
         self.outcomes.append(outcome)
 
 
-def _event():
+def _event(message_type=MessageType.TEXT):
     source = SessionSource(
         platform=Platform.FEISHU,
         chat_id="chat-1",
@@ -56,7 +57,7 @@ def _event():
     )
     return MessageEvent(
         text="process this",
-        message_type=MessageType.TEXT,
+        message_type=message_type,
         source=source,
         message_id="msg-1",
     )
@@ -70,6 +71,57 @@ def _safe_media_path(tmp_path, monkeypatch, name="file.pdf"):
     media_file.write_bytes(b"media")
     monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (root,))
     return media_file.resolve()
+
+
+def _configure_auto_tts(adapter, audio_path, monkeypatch):
+    adapter._should_auto_tts_for_chat = lambda _chat_id: True
+    monkeypatch.setattr("tools.tts_tool.check_tts_requirements", lambda: True)
+    monkeypatch.setattr(
+        "tools.tts_tool.text_to_speech_tool",
+        lambda **_kwargs: json.dumps({"file_path": str(audio_path)}),
+    )
+
+
+# ── auto-TTS delivery accounting ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_tts_only_success_marks_processing_success(tmp_path, monkeypatch):
+    """A captioned Telegram TTS response is the only delivery and must count."""
+    audio_path = tmp_path / "response.ogg"
+    audio_path.write_bytes(b"audio")
+    adapter = _AccountableAdapter(platform=Platform.TELEGRAM)
+    adapter._message_handler = AsyncMock(return_value="Spoken response")
+    adapter.play_tts = AsyncMock(
+        return_value=SendResult(success=True, message_id="voice-1")
+    )
+    _configure_auto_tts(adapter, audio_path, monkeypatch)
+    event = _event(MessageType.VOICE)
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert adapter.play_tts.await_count == 1
+    assert adapter.sent_text == []
+    assert adapter.outcomes == [ProcessingOutcome.SUCCESS]
+
+
+@pytest.mark.asyncio
+async def test_tts_failure_then_text_success_stays_processing_failure(tmp_path, monkeypatch):
+    """Text fallback success must not erase an earlier TTS delivery failure."""
+    audio_path = tmp_path / "response.ogg"
+    audio_path.write_bytes(b"audio")
+    adapter = _AccountableAdapter(platform=Platform.TELEGRAM)
+    adapter._message_handler = AsyncMock(return_value="Spoken response")
+    adapter.play_tts = AsyncMock(
+        return_value=SendResult(success=False, error="voice rejected")
+    )
+    _configure_auto_tts(adapter, audio_path, monkeypatch)
+    event = _event(MessageType.VOICE)
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert adapter.play_tts.await_count == 1
+    assert len(adapter.sent_text) == 1
+    assert adapter.outcomes == [ProcessingOutcome.FAILURE]
 
 
 # ── send_document failure ──────────────────────────────────────────────

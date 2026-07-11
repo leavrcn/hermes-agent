@@ -2583,6 +2583,13 @@ class DiscordAdapter(BasePlatformAdapter):
                         message_id=str(message.id) if getattr(message, "id", None) else None,
                     )
                 results.append(chunk_result)
+                if skipped_count:
+                    results.append(
+                        SendResult(
+                            success=False,
+                            error=f"Skipped {skipped_count} image(s) in Discord batch",
+                        )
+                    )
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
