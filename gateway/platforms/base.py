@@ -3228,7 +3228,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -3243,6 +3243,8 @@ class BasePlatformAdapter(ABC):
         """
         from urllib.parse import unquote as _unquote
 
+        errors: List[str] = []
+        last_message_id: Optional[str] = None
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -3274,10 +3276,36 @@ class BasePlatformAdapter(ABC):
                         caption=alt_text if alt_text else None,
                         metadata=metadata,
                     )
-                if not img_result.success:
-                    logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                if img_result.success:
+                    if img_result.message_id:
+                        last_message_id = img_result.message_id
+                else:
+                    error = img_result.error or "Image send failed"
+                    errors.append(error)
+                    logger.error("[%s] Failed to send image: %s", self.name, error)
             except Exception as img_err:
+                errors.append(str(img_err))
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+
+        return SendResult(
+            success=not errors,
+            message_id=last_message_id,
+            error="; ".join(errors) if errors else None,
+        )
+
+    @staticmethod
+    def _aggregate_send_results(results: List[SendResult]) -> SendResult:
+        """Combine item/chunk results with sticky-failure semantics."""
+        failures = [result.error or "Image send failed" for result in results if not result.success]
+        message_id = next(
+            (result.message_id for result in reversed(results) if result.message_id),
+            None,
+        )
+        return SendResult(
+            success=not failures,
+            message_id=message_id,
+            error="; ".join(failures) if failures else None,
+        )
 
     async def send_image(
         self,
@@ -4888,11 +4916,12 @@ class BasePlatformAdapter(ABC):
             nonlocal delivery_attempted, delivery_succeeded
             if result is None:
                 return
-            delivery_attempted = True
-            if getattr(result, "success", False):
-                delivery_succeeded = True
+            current_succeeded = bool(getattr(result, "success", False))
+            if not delivery_attempted:
+                delivery_succeeded = current_succeeded
             else:
-                delivery_succeeded = False
+                delivery_succeeded = delivery_succeeded and current_succeeded
+            delivery_attempted = True
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).

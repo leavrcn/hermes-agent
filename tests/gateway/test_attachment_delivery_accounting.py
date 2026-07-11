@@ -172,6 +172,112 @@ async def test_failed_image_batch_exception_marks_processing_failure(tmp_path, m
     )
 
 
+@pytest.mark.asyncio
+async def test_image_only_success_marks_processing_success():
+    """A successful image-only response is an accounted delivery."""
+    adapter = _AccountableAdapter()
+    adapter._message_handler = AsyncMock(
+        return_value="![diagram](https://example.com/diagram.png)"
+    )
+    adapter.send_multiple_images = AsyncMock(
+        return_value=SendResult(success=True, message_id="image-1")
+    )
+
+    await adapter._process_message_background(_event(), build_session_key(_event().source))
+
+    assert adapter.sent_text == []
+    assert adapter.outcomes == [ProcessingOutcome.SUCCESS]
+
+
+@pytest.mark.asyncio
+async def test_single_image_failure_returns_aggregate_failure_without_raising():
+    """The default image helper must expose a swallowed per-image failure."""
+    adapter = _AccountableAdapter()
+    adapter.send_image = AsyncMock(
+        return_value=SendResult(success=False, error="image rejected")
+    )
+
+    result = await adapter.send_multiple_images(
+        "chat-1", [("https://example.com/image.png", "diagram")]
+    )
+
+    assert result.success is False
+    assert "image rejected" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_multiple_images_mixed_results_return_aggregate_failure():
+    """Any failed item makes the default image batch fail as a whole."""
+    adapter = _AccountableAdapter()
+    adapter.send_image = AsyncMock(
+        side_effect=[
+            SendResult(success=True, message_id="image-1"),
+            SendResult(success=False, error="second image rejected"),
+        ]
+    )
+
+    result = await adapter.send_multiple_images(
+        "chat-1",
+        [
+            ("https://example.com/one.png", "one"),
+            ("https://example.com/two.png", "two"),
+        ],
+    )
+
+    assert result.success is False
+    assert "second image rejected" in (result.error or "")
+
+
+# ── sticky delivery aggregation ────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_attachment_failure_then_success_still_marks_processing_failure(
+    tmp_path, monkeypatch
+):
+    """A later successful attachment must not erase an earlier failure."""
+    first_path = _safe_media_path(tmp_path, monkeypatch, "first.pdf")
+    second_path = _safe_media_path(tmp_path, monkeypatch, "second.pdf")
+    adapter = _AccountableAdapter()
+    adapter._message_handler = AsyncMock(
+        return_value=f"MEDIA:{first_path}\nMEDIA:{second_path}"
+    )
+    adapter.send_document = AsyncMock(
+        side_effect=[
+            SendResult(success=False, error="first rejected"),
+            SendResult(success=True, message_id="document-2"),
+        ]
+    )
+
+    await adapter._process_message_background(_event(), build_session_key(_event().source))
+
+    assert adapter.send_document.await_count == 2
+    assert adapter.outcomes == [ProcessingOutcome.FAILURE]
+
+
+@pytest.mark.asyncio
+async def test_attachment_success_then_failure_marks_processing_failure(
+    tmp_path, monkeypatch
+):
+    """A failed later attachment must make the aggregate delivery fail."""
+    first_path = _safe_media_path(tmp_path, monkeypatch, "first.pdf")
+    second_path = _safe_media_path(tmp_path, monkeypatch, "second.pdf")
+    adapter = _AccountableAdapter()
+    adapter._message_handler = AsyncMock(
+        return_value=f"MEDIA:{first_path}\nMEDIA:{second_path}"
+    )
+    adapter.send_document = AsyncMock(
+        side_effect=[
+            SendResult(success=True, message_id="document-1"),
+            SendResult(success=False, error="second rejected"),
+        ]
+    )
+
+    await adapter._process_message_background(_event(), build_session_key(_event().source))
+
+    assert adapter.send_document.await_count == 2
+    assert adapter.outcomes == [ProcessingOutcome.FAILURE]
+
+
 # ── all attachments succeed ────────────────────────────────────────────
 
 @pytest.mark.asyncio

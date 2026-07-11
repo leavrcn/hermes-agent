@@ -1713,7 +1713,7 @@ class SlackAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Slack message with multiple file uploads.
 
         Uses ``files_upload_v2`` with its ``file_uploads`` parameter so all
@@ -1724,22 +1724,22 @@ class SlackAdapter(BasePlatformAdapter):
         The batch limit is 10 file uploads per call (Slack server-side cap).
         """
         if not self._app:
-            return
+            return SendResult(success=False, error="Not connected")
         if not images:
-            return
+            return SendResult(success=True)
 
         try:
             import httpx as _httpx
             from urllib.parse import unquote as _unquote
             from tools.url_safety import is_safe_url as _is_safe_url
         except Exception:
-            await super().send_multiple_images(chat_id, images, metadata, human_delay)
-            return
+            return await super().send_multiple_images(chat_id, images, metadata, human_delay)
 
         thread_ts = self._resolve_thread_ts(None, metadata)
 
         CHUNK = 10
         chunks = [images[i : i + CHUNK] for i in range(0, len(images), CHUNK)]
+        results: List[SendResult] = []
 
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
@@ -1799,7 +1799,14 @@ class SlackAdapter(BasePlatformAdapter):
                                 )
                                 continue
 
+                skipped_count = len(chunk) - len(file_uploads)
                 if not file_uploads:
+                    results.append(
+                        SendResult(
+                            success=False,
+                            error=f"Skipped {skipped_count} image(s) in Slack batch",
+                        )
+                    )
                     continue
 
                 initial_comment = (
@@ -1818,7 +1825,19 @@ class SlackAdapter(BasePlatformAdapter):
                     thread_ts=thread_ts,
                 )
                 self._record_uploaded_file_thread(chat_id, thread_ts)
-                _ = result
+                if skipped_count:
+                    results.append(
+                        SendResult(
+                            success=False,
+                            error=f"Skipped {skipped_count} image(s) in Slack batch",
+                        )
+                    )
+                results.append(
+                    SendResult(
+                        success=True,
+                        raw_response=result,
+                    )
+                )
             except Exception as e:
                 logger.warning(
                     "[Slack] Multi-image files_upload_v2 failed (chunk %d/%d), falling back to per-image: %s",
@@ -1827,9 +1846,13 @@ class SlackAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
-                await super().send_multiple_images(
-                    chat_id, chunk, metadata, human_delay=human_delay
+                results.append(
+                    await super().send_multiple_images(
+                        chat_id, chunk, metadata, human_delay=human_delay
+                    )
                 )
+
+        return self._aggregate_send_results(results)
 
     def _record_uploaded_file_thread(
         self, chat_id: str, thread_ts: Optional[str]

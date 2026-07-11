@@ -1173,7 +1173,7 @@ class SignalAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images via chunked Signal RPC calls.
 
         Per-image alt texts are dropped — Signal's send RPC only carries
@@ -1183,7 +1183,7 @@ class SignalAdapter(BasePlatformAdapter):
         the rate-limit scheduler handles inter-batch pacing.
         """
         if not images:
-            return
+            return SendResult(success=True)
 
         scheduler = get_scheduler()
         logger.info(
@@ -1225,12 +1225,22 @@ class SignalAdapter(BasePlatformAdapter):
             attachments.append(file_path)
 
         if not attachments:
-            logger.error(
-                "Signal: no valid images in batch of %d "
-                "(download=%d missing=%d oversize=%d)",
-                len(images), skipped_download, skipped_missing, skipped_oversize,
+            error = (
+                f"No valid images in batch of {len(images)} "
+                f"(download={skipped_download} missing={skipped_missing} oversize={skipped_oversize})"
             )
-            return
+            logger.error("Signal: %s", error.lower())
+            return SendResult(success=False, error=error)
+
+        results: List[SendResult] = []
+        skipped_total = skipped_download + skipped_missing + skipped_oversize
+        if skipped_total:
+            results.append(
+                SendResult(
+                    success=False,
+                    error=f"Skipped {skipped_total} invalid Signal image(s)",
+                )
+            )
 
         logger.info(
             "Signal send_multiple_images: %d/%d images valid, sending in chunks",
@@ -1265,6 +1275,8 @@ class SignalAdapter(BasePlatformAdapter):
 
             params = dict(base_params, attachments=att_batch)
             send_timeout = _signal_send_timeout(n)
+            batch_succeeded = False
+            batch_error = f"Signal batch {idx + 1}/{len(att_batches)} failed"
 
             for attempt in range(1, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS + 1):
                 await scheduler.acquire(n)
@@ -1277,6 +1289,7 @@ class SignalAdapter(BasePlatformAdapter):
                     if result is not None:
                         success, err_msg = self._validate_send_result(result)
                         if success:
+                            batch_succeeded = True
                             self._track_sent_timestamp(result)
                             await scheduler.report_rpc_duration(_rpc_duration, n)
                             logger.info(
@@ -1286,6 +1299,7 @@ class SignalAdapter(BasePlatformAdapter):
                                 attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                             )
                         else:
+                            batch_error = err_msg or batch_error
                             logger.error(
                                 "Signal: RPC send failed for batch %d/%d (%d attachments, "
                                 "attempt %d/%d, rpc_duration=%.1fs): %s",
@@ -1324,6 +1338,10 @@ class SignalAdapter(BasePlatformAdapter):
                 except SignalRateLimitError as e:
                     scheduler.feedback(e.retry_after, n)
                     if attempt >= SIGNAL_RATE_LIMIT_MAX_ATTEMPTS:
+                        batch_error = (
+                            f"Signal rate-limit retries exhausted for batch "
+                            f"{idx + 1}/{len(att_batches)}"
+                        )
                         logger.error(
                             "Signal: rate-limit retries exhausted on batch %d/%d "
                             "(%d attachments lost, server retry_after=%s)",
@@ -1339,6 +1357,15 @@ class SignalAdapter(BasePlatformAdapter):
                         attempt, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS,
                         f"{e.retry_after:.0f}s" if e.retry_after else "unknown",
                     )
+
+            results.append(
+                SendResult(
+                    success=batch_succeeded,
+                    error=None if batch_succeeded else batch_error,
+                )
+            )
+
+        return self._aggregate_send_results(results)
 
     async def _notify_batch_pacing(
         self,

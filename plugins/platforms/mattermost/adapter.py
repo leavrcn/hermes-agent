@@ -598,7 +598,7 @@ class MattermostAdapter(BasePlatformAdapter):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images as a single Mattermost post with multiple attachments.
 
         Mattermost supports up to 5 ``file_ids`` per post. Each image is
@@ -608,7 +608,7 @@ class MattermostAdapter(BasePlatformAdapter):
         base per-image loop on total failure.
         """
         if not images:
-            return
+            return SendResult(success=True)
 
         import mimetypes
         import aiohttp
@@ -616,6 +616,7 @@ class MattermostAdapter(BasePlatformAdapter):
 
         CHUNK = 5  # Mattermost post file_ids cap
         chunks = [images[i:i + CHUNK] for i in range(0, len(images), CHUNK)]
+        results: List[SendResult] = []
 
         for chunk_idx, chunk in enumerate(chunks):
             if human_delay > 0 and chunk_idx > 0:
@@ -663,6 +664,13 @@ class MattermostAdapter(BasePlatformAdapter):
                     if fid:
                         file_ids.append(fid)
 
+                if len(file_ids) != len(chunk):
+                    results.append(
+                        SendResult(
+                            success=False,
+                            error=f"Skipped {len(chunk) - len(file_ids)} image(s) in Mattermost batch",
+                        )
+                    )
                 if not file_ids:
                     continue
 
@@ -681,13 +689,27 @@ class MattermostAdapter(BasePlatformAdapter):
                 data = await self._post_preserving_thread(chat_id, payload, metadata)
                 if not data or "id" not in data:
                     logger.warning("Mattermost: multi-image post failed, falling back")
-                    await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                    results.append(
+                        await super().send_multiple_images(
+                            chat_id, chunk, metadata, human_delay=human_delay
+                        )
+                    )
+                else:
+                    results.append(
+                        SendResult(success=True, message_id=str(data["id"]), raw_response=data)
+                    )
             except Exception as e:
                 logger.warning(
                     "Mattermost: multi-image send failed (chunk %d/%d), falling back: %s",
                     chunk_idx + 1, len(chunks), e, exc_info=True,
                 )
-                await super().send_multiple_images(chat_id, chunk, metadata, human_delay=human_delay)
+                results.append(
+                    await super().send_multiple_images(
+                        chat_id, chunk, metadata, human_delay=human_delay
+                    )
+                )
+
+        return self._aggregate_send_results(results)
 
     # ------------------------------------------------------------------
     # WebSocket
