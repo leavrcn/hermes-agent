@@ -11,7 +11,16 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import FinalDeliveryState, effective_delivery_state
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    FinalDeliveryState,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+    SendResult,
+    effective_delivery_state,
+)
+from gateway.session import SessionSource, build_session_key
 from plugins.platforms.feishu.adapter import FeishuAdapter
 
 
@@ -43,6 +52,71 @@ def _make_adapter():
     adapter = FeishuAdapter(cfg)
     adapter._client = object()
     return adapter
+
+
+def _partial_result():
+    return SendResult(
+        success=False,
+        error="transient failure after first card",
+        retryable=True,
+        delivery_state=FinalDeliveryState.PARTIALLY_DELIVERED,
+        raw_response={"delivered_cards": 1, "total_cards": 2, "failed_index": 1},
+    )
+
+
+class _BasePartialDeliveryAdapter(BasePlatformAdapter):
+    """Concrete test adapter that exercises Base's real delivery orchestrator."""
+
+    def __init__(self, *, rich_result=None, send_result=None):
+        super().__init__(
+            PlatformConfig(enabled=True, token="test"),
+            Platform.FEISHU,
+        )
+        self.rich_result = rich_result
+        self.send_result = send_result or SendResult(success=True, message_id="legacy")
+        self.rich_calls = []
+        self.send_calls = []
+        self.processing_outcomes = []
+
+    async def connect(self, *, is_reconnect: bool = False):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.send_calls.append(
+            (
+                chat_id,
+                content,
+                {"reply_to": reply_to, "metadata": metadata},
+            )
+        )
+        return self.send_result
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id, "type": "dm"}
+
+    async def try_send_final_rich_response(self, **kwargs):
+        self.rich_calls.append(kwargs)
+        return self.rich_result
+
+    async def on_processing_complete(self, event, outcome):
+        self.processing_outcomes.append(outcome)
+
+
+def _base_event():
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_base_partial",
+        chat_type="dm",
+    )
+    return MessageEvent(
+        text="render a multi-card response",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="om_inbound",
+    )
 
 
 @pytest.mark.asyncio
@@ -153,3 +227,48 @@ async def test_try_send_final_rich_second_card_failure_returns_partial():
     assert result.success is False
     assert result.delivery_state is FinalDeliveryState.PARTIALLY_DELIVERED
     assert result.raw_response["delivered_cards"] == 1
+
+
+@pytest.mark.asyncio
+async def test_base_send_with_retry_stops_after_partial_delivery(monkeypatch):
+    """Base must not retry a logical response whose first card is visible."""
+    partial = _partial_result()
+    adapter = _BasePartialDeliveryAdapter(send_result=partial)
+    sleep = AsyncMock()
+    monkeypatch.setattr("gateway.platforms.base.asyncio.sleep", sleep)
+
+    result = await adapter._send_with_retry(
+        "oc_base_partial",
+        "multi-card response",
+        max_retries=2,
+        base_delay=0,
+    )
+
+    assert result is partial
+    assert len(adapter.send_calls) == 1
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_base_rich_partial_delivery_skips_legacy_send():
+    """The real Base orchestrator must not duplicate a partially visible card."""
+    adapter = _BasePartialDeliveryAdapter(rich_result=_partial_result())
+    adapter._message_handler = AsyncMock(return_value="multi-card final response")
+    event = _base_event()
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert len(adapter.rich_calls) == 1
+    assert adapter.send_calls == []
+
+
+@pytest.mark.asyncio
+async def test_base_rich_partial_delivery_completes_as_failure():
+    """Partial delivery suppresses fallback but remains a failed processing outcome."""
+    adapter = _BasePartialDeliveryAdapter(rich_result=_partial_result())
+    adapter._message_handler = AsyncMock(return_value="multi-card final response")
+    event = _base_event()
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert adapter.processing_outcomes == [ProcessingOutcome.FAILURE]
