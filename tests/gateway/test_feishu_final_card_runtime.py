@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import FinalDeliveryState
 from plugins.platforms.feishu.adapter import FeishuAdapter
 
 
@@ -241,7 +242,8 @@ async def test_feishu_final_rich_response_partial_multi_card_failure_does_not_fa
         is_ephemeral_response=False,
     )
 
-    assert result is not None and result.success is True
+    assert result is not None and result.success is False
+    assert result.delivery_state is FinalDeliveryState.PARTIALLY_DELIVERED
     assert [call["msg_type"] for call in calls] == ["interactive", "interactive"]
 
 
@@ -470,3 +472,138 @@ def test_nested_gateway_platforms_feishu_extra_loads_final_card_settings(tmp_pat
     extra = cfg.platforms[Platform.FEISHU].extra
     assert extra["final_response_format"] == "card"
     assert extra["markdown_tables"] == "markdown"
+
+
+# ---------------------------------------------------------------------------
+# T10: Regression tests locking already-correct behavior
+# ---------------------------------------------------------------------------
+
+
+class _EmptyImageKeyData:
+    image_key = None
+
+
+class _EmptyImageKeyResponse:
+    code = 230002
+    msg = "image upload returned no key"
+    data = _EmptyImageKeyData()
+
+    def success(self):
+        return True  # API "succeeded" but no image_key
+
+
+class _EmptyImageKeyApi:
+    def create(self, request):
+        return _EmptyImageKeyResponse()
+
+
+class _EmptyImageKeyClient:
+    im = SimpleNamespace(v1=SimpleNamespace(image=_EmptyImageKeyApi()))
+
+
+@pytest.mark.asyncio
+async def test_empty_image_key_raises_runtime_error(tmp_path):
+    """_upload_image_for_card must raise RuntimeError when image_key is empty."""
+    adapter = _make_adapter(final_response_format="card")
+    adapter._client = _EmptyImageKeyClient()
+
+    image = tmp_path / "a.png"
+    image.write_bytes(b"fake png")
+
+    with pytest.raises(RuntimeError, match="missing image_key"):
+        await adapter._upload_image_for_card(str(image))
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_with_media_tag_keeps_legacy_path(monkeypatch, tmp_path):
+    """auto mode + MEDIA tag: _should_send_final_response_as_card returns False."""
+    adapter = _make_adapter(final_response_format="auto")
+    media = tmp_path / "out.png"
+    media.write_bytes(b"fake")
+
+    result = adapter._should_send_final_response_as_card(
+        f"结果\nMEDIA:{media}",
+        metadata={"hermes_final_response": True},
+    )
+    assert result is False
+
+    # Also verify auto mode without media sends as card
+    result_no_media = adapter._should_send_final_response_as_card(
+        "普通文本",
+        metadata={"hermes_final_response": True},
+    )
+    assert result_no_media is True
+
+
+def test_real_sdk_create_and_reply_builders_accept_uuid():
+    """Real lark-oapi builders must accept uuid parameter."""
+    try:
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequestBody,
+            ReplyMessageRequestBody,
+        )
+    except ImportError:
+        pytest.skip("lark-oapi not installed; skipping SDK builder test")
+
+    create_body = (
+        CreateMessageRequestBody.builder()
+        .receive_id("oc_test")
+        .msg_type("interactive")
+        .content('{"schema":"2.0"}')
+        .uuid("test-uuid-12345")
+        .build()
+    )
+    assert create_body is not None
+
+    reply_body = (
+        ReplyMessageRequestBody.builder()
+        .content('{"schema":"2.0"}')
+        .msg_type("interactive")
+        .reply_in_thread(False)
+        .uuid("test-uuid-67890")
+        .build()
+    )
+    assert reply_body is not None
+
+
+@pytest.mark.asyncio
+async def test_interactive_thread_reply_failure_does_not_create_top_level_duplicate(monkeypatch):
+    """When interactive reply fails in thread with fallback code, should not create a new top-level message."""
+    adapter = _make_adapter(final_response_format="card")
+
+    send_calls = []  # track all _send_raw_message invocations
+
+    class _ThreadReplyFailResponse:
+        code = 230011
+        msg = "reply target withdrawn"
+        data = SimpleNamespace(message_id=None)
+
+        def success(self):
+            return False
+
+    class _FakeReplyApi:
+        def reply(self, request):
+            return _ThreadReplyFailResponse()
+
+        def create(self, request):
+            # This should NOT be called for thread messages
+            send_calls.append("create_called")
+            return _FakeResponse("om_new_top_level")
+
+    adapter._client = SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=_FakeReplyApi()))
+    )
+
+    response = await adapter._feishu_send_with_retry(
+        chat_id="oc_parent",
+        msg_type="interactive",
+        payload=json.dumps({"schema": "2.0", "body": {"elements": []}}),
+        reply_to="om_reply_target",
+        metadata={"thread_id": "omt_thread", "hermes_final_response": True},
+    )
+
+    # The failed reply response should be returned directly (not retried as create)
+    assert not response.success()
+    assert response.code == 230011
+    # Verify create was never called — no top-level duplicate
+    assert send_calls == [], "message.create should not be called for thread reply failure"
