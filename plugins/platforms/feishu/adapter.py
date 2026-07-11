@@ -5654,6 +5654,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    metadata=None,
 ):
     """Out-of-process Feishu/Lark delivery via the adapter's send pipeline.
 
@@ -5671,11 +5672,17 @@ async def _standalone_send(
         domain_name = getattr(adapter, "_domain_name", "feishu")
         domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
         adapter._client = adapter._build_lark_client(domain)
-        metadata = {"thread_id": thread_id} if thread_id else None
+        send_metadata = dict(metadata or {})
+        if thread_id:
+            send_metadata.setdefault("thread_id", thread_id)
 
         last_result = None
         if message.strip():
-            last_result = await adapter.send(chat_id, message, metadata=metadata)
+            last_result = await adapter.send(
+                chat_id,
+                message,
+                metadata=send_metadata or None,
+            )
             if not last_result.success:
                 return {"error": f"Feishu send failed: {last_result.error}"}
 
@@ -5684,15 +5691,15 @@ async def _standalone_send(
                 return {"error": f"Media file not found: {media_path}"}
             ext = os.path.splitext(media_path)[1].lower()
             if ext in _MIGRATION_IMAGE_EXTS:
-                last_result = await adapter.send_image_file(chat_id, media_path, metadata=metadata)
+                last_result = await adapter.send_image_file(chat_id, media_path, metadata=send_metadata or None)
             elif ext in _MIGRATION_VIDEO_EXTS:
-                last_result = await adapter.send_video(chat_id, media_path, metadata=metadata)
+                last_result = await adapter.send_video(chat_id, media_path, metadata=send_metadata or None)
             elif ext in _MIGRATION_VOICE_EXTS and is_voice:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
+                last_result = await adapter.send_voice(chat_id, media_path, metadata=send_metadata or None)
             elif ext in _MIGRATION_AUDIO_EXTS:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
+                last_result = await adapter.send_voice(chat_id, media_path, metadata=send_metadata or None)
             else:
-                last_result = await adapter.send_document(chat_id, media_path, metadata=metadata)
+                last_result = await adapter.send_document(chat_id, media_path, metadata=send_metadata or None)
             if not last_result.success:
                 return {"error": f"Feishu media send failed: {last_result.error}"}
 

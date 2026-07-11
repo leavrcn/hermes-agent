@@ -59,6 +59,25 @@ from .session import SessionSource
 from .dead_targets import DeadTargetRegistry
 
 
+def metadata_for_delivery_purpose(
+    platform: Platform,
+    metadata: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Clone semantic delivery metadata and add platform-private markers.
+
+    Callers describe *why* a payload is being sent.  This boundary owns the
+    platform-specific representation so cron, handoff, and other entry points
+    never need to know Feishu's private final-card marker.
+    """
+    send_metadata = dict(metadata or {})
+    if (
+        platform == Platform.FEISHU
+        and send_metadata.get("delivery_purpose") == "assistant_final"
+    ):
+        send_metadata["hermes_final_response"] = True
+    return send_metadata
+
+
 def looks_like_telegram_private_chat_id(chat_id: Optional[str]) -> bool:
     """True when ``chat_id`` is a positive int — Telegram's private-chat shape.
 
@@ -471,16 +490,7 @@ class DeliveryRouter:
                 "delivered": False,
             }
 
-        send_metadata = dict(metadata or {})
-        # Map delivery_purpose to platform-specific final-response marker.
-        # Callers (cron, handoff) set the semantic field
-        # ``delivery_purpose="assistant_final"``; the router translates it
-        # to the Feishu-specific ``hermes_final_response=True`` marker so
-        # the adapter can emit a final-response card.  Other purposes
-        # (notice, progress, typing) are left untouched.
-        if send_metadata.get("delivery_purpose") == "assistant_final":
-            if target.platform == Platform.FEISHU:
-                send_metadata["hermes_final_response"] = True
+        send_metadata = metadata_for_delivery_purpose(target.platform, metadata)
         is_named_telegram_private_topic = False
         named_telegram_private_topic_name: Optional[str] = None
         if target.thread_id:

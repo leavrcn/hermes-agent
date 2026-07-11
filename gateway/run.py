@@ -1753,7 +1753,11 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
 )
-from gateway.delivery import DeliveryRouter, looks_like_telegram_private_chat_id
+from gateway.delivery import (
+    DeliveryRouter,
+    DeliveryTarget,
+    looks_like_telegram_private_chat_id,
+)
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -7623,10 +7627,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if effective_thread_id:
             send_metadata["thread_id"] = effective_thread_id
         try:
-            result = await adapter.send(
-                chat_id=str(home.chat_id),
-                content=response_text,
-                metadata=send_metadata or None,
+            delivery_router = getattr(self, "delivery_router", None)
+            if delivery_router is None:
+                delivery_router = DeliveryRouter(self.config, self.adapters)
+            result = await delivery_router._deliver_to_platform(
+                DeliveryTarget(
+                    platform=platform,
+                    chat_id=str(home.chat_id),
+                    is_explicit=True,
+                ),
+                response_text,
+                send_metadata,
             )
         except Exception as exc:
             raise RuntimeError(f"adapter.send failed: {exc}") from exc
