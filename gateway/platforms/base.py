@@ -4961,6 +4961,14 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            # Streaming handlers can return a SendResult when the response body
+            # was already delivered but a post-stream attachment failed.  Treat
+            # it as an attempted delivery outcome instead of parsing it as text;
+            # this preserves machine-readable failure accounting without causing
+            # a duplicate body send or a generic exception notification.
+            if isinstance(response, SendResult):
+                _record_delivery(response)
+                response = None
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to

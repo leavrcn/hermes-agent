@@ -9,6 +9,9 @@ fixed schema version rather than a user-configurable setting.
 from __future__ import annotations
 
 import argparse
+import errno
+import os
+import tempfile
 from collections.abc import Mapping, MutableMapping, MutableSequence, Sequence
 from pathlib import Path
 from typing import Any
@@ -154,6 +157,48 @@ def _verify_migrated_text(
         raise ValueError("non-Feishu card_schema settings changed during migration")
 
 
+def _atomic_replace_bytes(config_path: Path, data: bytes, mode: int) -> None:
+    """Durably replace ``config_path`` without exposing a truncated file."""
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{config_path.name}.",
+        suffix=".tmp",
+        dir=config_path.parent,
+    )
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(fd, mode)
+        remaining = memoryview(data)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError(errno.EIO, "temporary configuration write made no progress")
+            remaining = remaining[written:]
+        # os.write is unbuffered, so there is no userspace buffer to flush.
+        # fsync publishes every completed write before the atomic rename.
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+
+        os.replace(temp_path, config_path)
+        temp_path = None
+
+        # Persist the directory entry update as well as the file contents.
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(config_path.parent, directory_flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def migrate_config(config_path: Path, *, apply: bool) -> list[str]:
     """Remove Feishu card_schema lines without changing any other file bytes."""
     original_bytes = config_path.read_bytes()
@@ -181,15 +226,20 @@ def migrate_config(config_path: Path, *, apply: bool) -> list[str]:
 
     # Validate before writing so unsupported input can never damage the source file.
     _verify_migrated_text(migrated_text, expected_unrelated)
-    config_path.write_bytes(migrated_bytes)
+    original_mode = config_path.stat().st_mode & 0o7777
     try:
+        _atomic_replace_bytes(config_path, migrated_bytes, original_mode)
         written_bytes = config_path.read_bytes()
         if written_bytes != migrated_bytes:
             raise ValueError("written configuration differs from validated migration bytes")
         # Re-parse the actual on-disk result and re-check migration scope.
         _verify_migrated_text(written_bytes.decode("utf-8"), expected_unrelated)
     except Exception:
-        config_path.write_bytes(original_bytes)
+        # A temp-write or replace failure leaves the original path untouched.
+        # If only post-replace verification failed, restore the original bytes
+        # through the same atomic path rather than truncating in place.
+        if config_path.read_bytes() != original_bytes:
+            _atomic_replace_bytes(config_path, original_bytes, original_mode)
         raise
 
     return removed_paths

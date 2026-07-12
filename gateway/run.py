@@ -1766,6 +1766,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    SendResult,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     merge_pending_message_event,
@@ -12112,10 +12113,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
+                _media_delivery_result = None
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
-                        await self._deliver_media_from_response(
+                        _media_delivery_result = await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
                 # Streaming already delivered the body text, but the footer was
@@ -12133,6 +12135,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                if (
+                    _media_delivery_result is not None
+                    and not _media_delivery_result.success
+                ):
+                    # BasePlatformAdapter consumes SendResult as an already-attempted
+                    # delivery outcome.  Returning the structured failure lets the
+                    # processing lifecycle mark this streamed turn as failed without
+                    # re-sending the body text or showing a generic exception reply.
+                    return _media_delivery_result
                 return None
 
             return response
@@ -13159,15 +13170,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response: str,
         event: MessageEvent,
         adapter,
-    ) -> None:
-        """Extract MEDIA: tags and local file paths from a response and deliver them.
+    ) -> SendResult:
+        """Deliver post-stream attachments and return their aggregate outcome.
 
-        Called after streaming has already sent the text to the user, so the
-        text itself is already delivered — this only handles file attachments
-        that the normal _process_message_background path would have caught.
+        The streamed body text is already visible.  Every attachment send result
+        is therefore aggregated with sticky-failure semantics so a provider that
+        returns ``SendResult(success=False)`` cannot be mistaken for success.
+        Individual failures do not stop later attachments from being attempted.
         """
         from pathlib import Path
         from urllib.parse import quote as _quote
+
+        attempts: list[dict[str, Any]] = []
+
+        def _record_attempt(kind: str, result: Any = None, error: Exception | None = None) -> None:
+            if error is not None:
+                attempts.append({"kind": kind, "success": False, "error": str(error)})
+                return
+            success = bool(getattr(result, "success", False))
+            detail = getattr(result, "error", None)
+            if result is None:
+                detail = "sender returned no SendResult"
+            attempts.append({"kind": kind, "success": success, "error": detail})
+            if not success:
+                logger.warning(
+                    "[%s] Post-stream %s delivery returned failure: %s",
+                    adapter.name,
+                    kind,
+                    detail or "unspecified error",
+                )
 
         try:
             # Capture [[as_document]] before extract_media strips it, so the
@@ -13222,58 +13253,81 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
+                    image_result = await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
                     )
+                    _record_attempt("image batch", image_result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+                    _record_attempt("image batch", error=e)
 
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        media_result = await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
                         )
+                        media_kind = "voice"
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        media_result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
                         )
+                        media_kind = "video"
                     else:
-                        await adapter.send_document(
+                        media_result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
                             metadata=_thread_meta,
                         )
+                        media_kind = "document"
+                    _record_attempt(media_kind, media_result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    _record_attempt("media", error=e)
 
             for file_path in non_image_local:
                 try:
                     ext = Path(file_path).suffix.lower()
                     if ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        local_result = await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=file_path,
                             metadata=_thread_meta,
                         )
+                        local_kind = "video"
                     else:
-                        await adapter.send_document(
+                        local_result = await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=file_path,
                             metadata=_thread_meta,
                         )
+                        local_kind = "document"
+                    _record_attempt(local_kind, local_result)
                 except Exception as e:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
+                    _record_attempt("file", error=e)
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+            _record_attempt("extraction", error=e)
+
+        failures = [attempt for attempt in attempts if not attempt["success"]]
+        return SendResult(
+            success=not failures,
+            error="; ".join(
+                f"{attempt['kind']}: {attempt['error'] or 'unspecified error'}"
+                for attempt in failures
+            )
+            or None,
+            raw_response={"attempts": attempts},
+        )
 
 
 

@@ -13,7 +13,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+    SendResult,
+)
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, build_session_key
 
@@ -131,6 +137,110 @@ def _fake_runner(thread_meta):
     return runner
 
 
+def _streaming_adapter(**send_overrides):
+    """Build a post-stream adapter whose media senders expose SendResult."""
+    senders = {
+        "send_multiple_images": AsyncMock(
+            return_value=SendResult(success=True, message_id="images")
+        ),
+        "send_voice": AsyncMock(
+            return_value=SendResult(success=True, message_id="voice")
+        ),
+        "send_document": AsyncMock(
+            return_value=SendResult(success=True, message_id="document")
+        ),
+        "send_video": AsyncMock(
+            return_value=SendResult(success=True, message_id="video")
+        ),
+    }
+    senders.update(send_overrides)
+    return SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        **senders,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "sender_name"),
+    [
+        ("diagram.png", "send_multiple_images"),
+        ("speech.mp3", "send_voice"),
+        ("clip.mp4", "send_video"),
+        ("report.pdf", "send_document"),
+    ],
+)
+async def test_post_stream_media_returned_failure_is_propagated(
+    tmp_path, monkeypatch, filename, sender_name
+):
+    media_file = _allowed_media_path(tmp_path, monkeypatch, filename)
+    failed_sender = AsyncMock(
+        return_value=SendResult(success=False, error="upload rejected")
+    )
+    adapter = _streaming_adapter(**{sender_name: failed_sender})
+
+    result = await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "topic-1"}),
+        f"MEDIA:{media_file}",
+        _event(thread_id="topic-1"),
+        adapter,
+    )
+
+    assert result.success is False
+    assert "upload rejected" in (result.error or "")
+    failed_sender.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_post_stream_media_failure_is_sticky_while_later_media_still_sends(
+    tmp_path, monkeypatch
+):
+    rejected = _allowed_media_path(tmp_path, monkeypatch, "rejected.pdf")
+    delivered = _allowed_media_path(tmp_path, monkeypatch, "delivered.mp4")
+    adapter = _streaming_adapter(
+        send_document=AsyncMock(
+            return_value=SendResult(success=False, error="upload rejected")
+        ),
+        send_video=AsyncMock(
+            return_value=SendResult(success=True, message_id="video")
+        ),
+    )
+
+    result = await GatewayRunner._deliver_media_from_response(
+        _fake_runner(None),
+        f"MEDIA:{rejected}\nMEDIA:{delivered}",
+        _event(),
+        adapter,
+    )
+
+    assert result.success is False
+    assert "upload rejected" in (result.error or "")
+    adapter.send_document.assert_awaited_once()
+    adapter.send_video.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_base_processing_consumes_stream_delivery_failure_without_error_reply(caplog):
+    adapter = _MediaRoutingAdapter()
+    event = _event()
+    adapter._message_handler = AsyncMock(
+        return_value=SendResult(success=False, error="upload rejected")
+    )
+    adapter.on_processing_complete = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="error"))
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    adapter.on_processing_complete.assert_awaited_once_with(
+        event, ProcessingOutcome.FAILURE
+    )
+    adapter.send.assert_not_awaited()
+    assert "Error handling message" not in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_streaming_delivery_routes_telegram_flac_media_tag_to_document_sender(tmp_path, monkeypatch):
     event = _event(thread_id="topic-1")
@@ -241,6 +351,7 @@ async def test_streaming_delivery_blocks_media_path_outside_allowed_roots(tmp_pa
     # 2026-05; this test pins strict on explicitly.)
     monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "1")
     monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", "")
     adapter = SimpleNamespace(
         name="test",
         extract_media=BasePlatformAdapter.extract_media,

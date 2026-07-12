@@ -7,7 +7,7 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
 from gateway.response_filters import (
     is_intentional_silence_agent_result,
@@ -163,3 +163,53 @@ async def test_prose_mentioning_silence_token_is_delivered(monkeypatch, tmp_path
     )
 
     assert response == text
+
+
+@pytest.mark.asyncio
+async def test_streamed_media_failure_is_returned_to_delivery_accounting(
+    monkeypatch, tmp_path
+):
+    runner = _runner(monkeypatch, tmp_path)
+    media_root = tmp_path / "media-cache"
+    media_root.mkdir()
+    document = media_root / "report.pdf"
+    document.write_bytes(b"pdf")
+    monkeypatch.setattr(
+        "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (media_root,)
+    )
+    adapter = MagicMock()
+    adapter.name = "telegram"
+    adapter.extract_media = BasePlatformAdapter.extract_media
+    adapter.extract_images = BasePlatformAdapter.extract_images
+    adapter.extract_local_files = BasePlatformAdapter.extract_local_files
+    adapter.send_document = AsyncMock(
+        return_value=SendResult(success=False, error="upload rejected")
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="notice"))
+    runner._adapter_for_source = lambda source: adapter
+    runner._thread_metadata_for_source = (
+        lambda source, reply_to_message_id=None: None
+    )
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": f"MEDIA:{document}",
+            "messages": [
+                {"role": "user", "content": "make a report"},
+                {"role": "assistant", "content": f"MEDIA:{document}"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "failed": False,
+            "already_sent": True,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert isinstance(response, SendResult)
+    assert response.success is False
+    assert "upload rejected" in (response.error or "")

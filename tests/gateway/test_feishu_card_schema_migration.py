@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import importlib
+import os
+import stat
 
 import pytest
 from ruamel.yaml import YAML
@@ -186,3 +189,58 @@ def test_apply_rejects_complex_target_without_changing_file(tmp_path, target_yam
         _migration_module().main(["--config", str(config_path), "--apply"])
 
     assert config_path.read_bytes() == before
+
+
+def test_apply_temp_write_failure_keeps_original_and_cleans_temp_file(
+    tmp_path, monkeypatch
+):
+    config_path = _write_config(tmp_path)
+    before = config_path.read_bytes()
+    before_entries = set(tmp_path.iterdir())
+    real_write = os.write
+    injected = False
+
+    def partial_write_then_enospc(fd, data):
+        nonlocal injected
+        if not injected:
+            injected = True
+            real_write(fd, data[: max(1, len(data) // 2)])
+            raise OSError(errno.ENOSPC, "no space left on device")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", partial_write_then_enospc)
+
+    with pytest.raises(OSError, match="no space left on device"):
+        _migration_module().main(["--config", str(config_path), "--apply"])
+
+    assert config_path.read_bytes() == before
+    assert set(tmp_path.iterdir()) == before_entries
+
+
+def test_apply_replace_failure_keeps_original_and_cleans_temp_file(
+    tmp_path, monkeypatch
+):
+    config_path = _write_config(tmp_path)
+    before = config_path.read_bytes()
+    before_entries = set(tmp_path.iterdir())
+
+    def reject_replace(_source, _destination):
+        raise OSError(errno.EIO, "replace failed")
+
+    monkeypatch.setattr(os, "replace", reject_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        _migration_module().main(["--config", str(config_path), "--apply"])
+
+    assert config_path.read_bytes() == before
+    assert set(tmp_path.iterdir()) == before_entries
+
+
+def test_apply_atomic_replace_preserves_original_permissions(tmp_path):
+    config_path = _write_config(tmp_path)
+    config_path.chmod(0o640)
+    before_mode = stat.S_IMODE(config_path.stat().st_mode)
+
+    _migration_module().main(["--config", str(config_path), "--apply"])
+
+    assert stat.S_IMODE(config_path.stat().st_mode) == before_mode
