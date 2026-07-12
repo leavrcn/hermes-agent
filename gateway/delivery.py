@@ -55,8 +55,13 @@ def _is_silence_narration(content: Optional[str]) -> bool:
     return bool(_SILENCE_NARRATION.match(stripped))
 
 from .config import Platform, GatewayConfig
-from .session import SessionSource
 from .dead_targets import DeadTargetRegistry
+from .platforms.base import (
+    FinalDeliveryState,
+    SendResult,
+    effective_delivery_state,
+)
+from .session import SessionSource
 
 
 def metadata_for_delivery_purpose(
@@ -108,6 +113,14 @@ def _send_result_failed(result: Any) -> bool:
     if isinstance(result, dict):
         return result.get("success") is False
     return getattr(result, "success", True) is False
+
+
+def _send_result_partially_delivered(result: Any) -> bool:
+    """Return whether a failed adapter result already exposed visible content."""
+    return (
+        isinstance(result, SendResult)
+        and effective_delivery_state(result) is FinalDeliveryState.PARTIALLY_DELIVERED
+    )
 
 
 def _send_result_error(result: Any) -> Optional[str]:
@@ -312,6 +325,13 @@ class DeliveryRouter:
                     result = self._deliver_local(content, job_id, job_name, metadata)
                 else:
                     result = await self._deliver_to_platform(target, content, metadata)
+                    if _send_result_partially_delivered(result):
+                        results[target.to_string()] = {
+                            "success": False,
+                            "delivery_state": FinalDeliveryState.PARTIALLY_DELIVERED.value,
+                            "result": result,
+                        }
+                        continue
                     # Successful platform delivery — clear any stale dead flag.
                     if target.chat_id and not _send_result_failed(result):
                         self.dead_targets.clear(target.platform.value, target.chat_id)
@@ -545,6 +565,8 @@ class DeliveryRouter:
                 send_metadata["thread_id"] = target_thread_id
         result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
         if _send_result_failed(result):
+            if _send_result_partially_delivered(result):
+                return result
             if (
                 is_named_telegram_private_topic
                 and named_telegram_private_topic_name
@@ -568,6 +590,8 @@ class DeliveryRouter:
                 send_metadata["telegram_dm_topic_created_for_send"] = True
                 result = await adapter.send(target.chat_id, content, metadata=send_metadata or None)
             if _send_result_failed(result):
+                if _send_result_partially_delivered(result):
+                    return result
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
 

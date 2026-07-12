@@ -542,8 +542,19 @@ class TestRoutingIntents:
 
     def test_all_token_case_insensitive(self, monkeypatch):
         """'ALL' / 'All' / 'all' are all recognized."""
-        from cron.scheduler import _resolve_delivery_targets
+        from cron.scheduler import (
+            _HOME_TARGET_ENV_VARS,
+            _LEGACY_HOME_TARGET_ENV_VARS,
+            _resolve_delivery_targets,
+        )
 
+        # Assert case-folding with exactly two homes, independent of operator
+        # channels loaded from ~/.hermes/.env in the host test process.
+        for env_name in {
+            *_HOME_TARGET_ENV_VARS.values(),
+            *_LEGACY_HOME_TARGET_ENV_VARS.values(),
+        }:
+            monkeypatch.setenv(env_name, "")
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
         monkeypatch.setenv("DISCORD_HOME_CHANNEL", "-222")
 
@@ -3963,6 +3974,72 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         result, standalone_send = self._run(MagicMock(success=True, raw_response=None))
         assert result is None
         standalone_send.assert_not_awaited()
+
+
+class TestDeliverResultLiveAdapterPartial:
+    def test_partial_delivery_stops_before_standalone_resend(self):
+        """Router→Cron preserves visible partials and never duplicates card one."""
+        import asyncio as _asyncio
+        from concurrent.futures import Future
+
+        from gateway.config import Platform
+        from gateway.platforms.base import FinalDeliveryState, SendResult
+
+        partial = SendResult(
+            success=False,
+            error="second card failed",
+            delivery_state=FinalDeliveryState.PARTIALLY_DELIVERED,
+            raw_response={"delivered_cards": 1, "total_cards": 2},
+        )
+
+        class _PartialAdapter:
+            def __init__(self):
+                self.calls = []
+
+            async def send(self, chat_id, content, metadata=None):
+                self.calls.append((chat_id, content, metadata))
+                return partial
+
+        adapter = _PartialAdapter()
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        pconfig.extra = {}
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.FEISHU: pconfig}
+        mock_cfg.filter_silence_narration = False
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        job = {
+            "id": "partial-card-job",
+            "deliver": "origin",
+            "origin": {"platform": "feishu", "chat_id": "oc_partial"},
+        }
+
+        def fake_run_coro(coro, _loop):
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        standalone_send = AsyncMock(return_value={"success": True})
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro), \
+             patch("tools.send_message_tool._send_to_platform", new=standalone_send):
+            result = _deliver_result(
+                job,
+                "two-card response",
+                adapters={Platform.FEISHU: adapter},
+                loop=loop,
+            )
+
+        assert len(adapter.calls) == 1
+        assert partial.raw_response["delivered_cards"] == 1
+        standalone_send.assert_not_awaited()
+        assert result is not None
+        assert "partially delivered" in result.lower()
 
 
 class TestDeliverOriginUnresolvableIsLocal:

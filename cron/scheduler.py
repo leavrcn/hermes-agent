@@ -1346,6 +1346,21 @@ def _confirm_adapter_delivery(send_result) -> bool:
     return bool(getattr(send_result, "success"))
 
 
+def _is_partial_adapter_delivery(send_result) -> bool:
+    """Return True when live delivery failed after exposing visible content."""
+    from gateway.platforms.base import (
+        FinalDeliveryState,
+        SendResult,
+        effective_delivery_state,
+    )
+
+    return (
+        isinstance(send_result, SendResult)
+        and effective_delivery_state(send_result)
+        is FinalDeliveryState.PARTIALLY_DELIVERED
+    )
+
+
 def _is_channel_dm_topic(
     runtime_adapter: Any,
     chat_id: Any,
@@ -1540,6 +1555,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
+        partial_delivery = False
         target_errors = []
 
         # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
@@ -1790,7 +1806,27 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 send_success = _confirm_adapter_delivery(send_result)
                                 send_raw_response = getattr(send_result, "raw_response", None)
 
-                            if not send_success:
+                            if _is_partial_adapter_delivery(send_result):
+                                delivered_cards = (
+                                    send_raw_response.get("delivered_cards")
+                                    if isinstance(send_raw_response, dict)
+                                    else None
+                                )
+                                count_detail = (
+                                    f" after {delivered_cards} visible card(s)"
+                                    if delivered_cards is not None
+                                    else ""
+                                )
+                                msg = (
+                                    f"live adapter partially delivered to "
+                                    f"{platform_name}:{chat_id}{count_detail}; "
+                                    "standalone fallback suppressed to avoid duplicate content"
+                                )
+                                logger.warning("Job '%s': %s", job["id"], msg)
+                                delivery_errors.append(msg)
+                                adapter_ok = False
+                                partial_delivery = True
+                            elif not send_success:
                                 if isinstance(send_result, dict):
                                     err = send_result.get("error", "unknown")
                                     shape = "dict"
@@ -1887,7 +1923,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     job["id"], err_msg,
                 )
 
-        if not delivered:
+        if not delivered and not partial_delivery:
             # If the interpreter is finalizing (gateway SIGTERM / restart /
             # OOM), scheduling any new delivery is futile — asyncio.run and a
             # fresh ThreadPoolExecutor both raise "cannot schedule new futures

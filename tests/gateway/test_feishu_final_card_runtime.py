@@ -7,7 +7,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import FinalDeliveryState
+from gateway.platforms.base import (
+    FinalDeliveryState,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+)
+from gateway.session import SessionSource, build_session_key
 from plugins.platforms.feishu.adapter import FeishuAdapter
 
 
@@ -176,6 +182,57 @@ async def test_feishu_final_response_auto_mode_keeps_legacy_when_media_tag_prese
 
     assert len(calls) == 1
     assert calls[0]["msg_type"] != "interactive"
+
+
+@pytest.mark.asyncio
+async def test_feishu_base_auto_media_uses_legacy_text_and_native_attachment_once(
+    monkeypatch,
+    tmp_path,
+):
+    """The real Base pipeline must preserve auto+MEDIA's legacy/native rail."""
+    media_root = tmp_path / "media-cache"
+    media = media_root / "out.png"
+    media.parent.mkdir(parents=True)
+    media.write_bytes(b"fake png")
+    monkeypatch.setattr(
+        "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+        (media_root,),
+    )
+
+    adapter = _make_adapter(final_response_format="auto")
+    adapter.config.typing_indicator = False
+    adapter._client = _FakeClient()
+    outbound = []
+
+    async def fake_send(**kwargs):
+        outbound.append(kwargs)
+        return _FakeResponse(f"om_{len(outbound)}")
+
+    monkeypatch.setattr(adapter, "_feishu_send_with_retry", fake_send)
+    adapter._message_handler = AsyncMock(return_value=f"结果\nMEDIA:{media.resolve()}")
+    adapter.on_processing_complete = AsyncMock()
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        chat_id="oc_base_auto_media",
+        chat_type="dm",
+    )
+    event = MessageEvent(
+        text="生成图片",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="om_inbound",
+    )
+
+    await adapter._process_message_background(event, build_session_key(source))
+
+    assert len(outbound) == 2
+    assert all(call["msg_type"] != "interactive" for call in outbound)
+    assert sum(call["msg_type"] in {"post", "text"} for call in outbound) == 1
+    assert sum(call["msg_type"] == "image" for call in outbound) == 1
+    adapter.on_processing_complete.assert_awaited_once_with(
+        event,
+        ProcessingOutcome.SUCCESS,
+    )
 
 
 @pytest.mark.asyncio

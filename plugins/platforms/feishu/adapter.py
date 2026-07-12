@@ -184,6 +184,7 @@ _DOCUMENT_MIME_TO_EXT = {mime: ext for ext, mime in SUPPORTED_DOCUMENT_TYPES.ite
 _FEISHU_IMAGE_UPLOAD_TYPE = "message"
 _FEISHU_CARD_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 _FEISHU_CARD_MAX_IMAGES = 3
+_FEISHU_FORCE_LEGACY_FINAL_RESPONSE = "_feishu_force_legacy_final_response"
 _FEISHU_FILE_UPLOAD_TYPE = "stream"
 _FEISHU_OPUS_UPLOAD_EXTENSIONS = {".ogg", ".opus"}
 _FEISHU_MEDIA_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".avi", ".m4v"}
@@ -1933,6 +1934,8 @@ class FeishuAdapter(BasePlatformAdapter):
         mode = self._final_response_card_mode(metadata)
         if mode not in {"card", "auto"}:
             return False
+        if isinstance(metadata, dict) and metadata.get(_FEISHU_FORCE_LEGACY_FINAL_RESPONSE):
+            return False
         # Auto mode keeps legacy delivery for responses with native attachments
         # so the shared BasePlatformAdapter extraction path can deliver MEDIA
         # files. Explicit card mode may still combine safe images via the rich
@@ -1972,6 +1975,15 @@ class FeishuAdapter(BasePlatformAdapter):
         """Try to combine final reply text and safe images into one Card v2."""
         mode = self._final_response_card_mode(metadata)
         if mode not in {"card", "auto"}:
+            return None
+        if mode == "auto" and iter_media_tag_paths(original_response or ""):
+            # Base extracts MEDIA controls before invoking this hook, so the
+            # later legacy text send no longer contains the signal used by
+            # _should_send_final_response_as_card(). Preserve that signal on
+            # this per-delivery metadata object while returning None to keep
+            # the shared legacy text + native attachment rail.
+            if isinstance(metadata, dict):
+                metadata[_FEISHU_FORCE_LEGACY_FINAL_RESPONSE] = True
             return None
         if is_ephemeral_response or force_document_attachments or not self._client:
             return None

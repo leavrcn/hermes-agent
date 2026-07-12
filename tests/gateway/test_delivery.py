@@ -4,7 +4,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.delivery import DeliveryRouter, DeliveryTarget
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import FinalDeliveryState, SendResult
 from gateway.session import SessionSource
 
 
@@ -273,6 +273,19 @@ class FailingAdapter:
         return SendResult(success=False, error="route failed", retryable=False)
 
 
+class PartiallyDeliveredAdapter:
+    def __init__(self):
+        self.result = SendResult(
+            success=False,
+            error="second card failed",
+            delivery_state=FinalDeliveryState.PARTIALLY_DELIVERED,
+            raw_response={"delivered_cards": 1, "total_cards": 2},
+        )
+
+    async def send(self, chat_id, content, metadata=None):
+        return self.result
+
+
 @pytest.mark.asyncio
 async def test_platform_send_failure_raises_for_delivery_result(tmp_path, monkeypatch):
     monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
@@ -281,6 +294,35 @@ async def test_platform_send_failure_raises_for_delivery_result(tmp_path, monkey
 
     with pytest.raises(RuntimeError, match="route failed"):
         await router._deliver_to_platform(target, "hello", metadata={"telegram_reply_to_message_id": "9001"})
+
+
+@pytest.mark.asyncio
+async def test_platform_partial_delivery_is_returned_for_machine_handling(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = PartiallyDeliveredAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.FEISHU: adapter})
+    target = DeliveryTarget.parse("feishu:oc_partial")
+
+    result = await router._deliver_to_platform(target, "two-card response", metadata=None)
+
+    assert result is adapter.result
+    assert getattr(result, "delivery_state", None) is FinalDeliveryState.PARTIALLY_DELIVERED
+
+
+@pytest.mark.asyncio
+async def test_router_deliver_reports_partial_without_flattening_to_exception(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = PartiallyDeliveredAdapter()
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.FEISHU: adapter})
+    target = DeliveryTarget.parse("feishu:oc_partial")
+
+    results = await router.deliver("two-card response", [target])
+
+    routed = results[target.to_string()]
+    assert routed["success"] is False
+    assert routed["delivery_state"] == FinalDeliveryState.PARTIALLY_DELIVERED.value
+    assert routed["result"] is adapter.result
+    assert "error" not in routed
 
 
 # ---------------------------------------------------------------------------
