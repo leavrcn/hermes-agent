@@ -246,6 +246,9 @@ def test_apply_atomic_replace_preserves_original_permissions(tmp_path):
     assert stat.S_IMODE(config_path.stat().st_mode) == before_mode
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "fchown"), reason="requires POSIX fchown fault injection"
+)
 def test_apply_chown_failure_keeps_original_and_cleans_temp_file(tmp_path, monkeypatch):
     config_path = _write_config(tmp_path)
     before = config_path.read_bytes()
@@ -263,7 +266,10 @@ def test_apply_chown_failure_keeps_original_and_cleans_temp_file(tmp_path, monke
     assert set(tmp_path.iterdir()) == before_entries
 
 
-@pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create a foreign-owned fixture")
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="requires root to create a foreign-owned fixture",
+)
 def test_apply_atomic_replace_preserves_original_owner_group(tmp_path):
     config_path = _write_config(tmp_path)
     original_uid = 65534
@@ -279,3 +285,177 @@ def test_apply_atomic_replace_preserves_original_owner_group(tmp_path):
         before_stat.st_gid,
     )
     assert stat.S_IMODE(after_stat.st_mode) == stat.S_IMODE(before_stat.st_mode)
+
+
+def test_apply_preserves_symlink_and_migrates_real_target(tmp_path):
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    real_config = _write_config(managed_dir)
+    link_dir = tmp_path / "profile"
+    link_dir.mkdir()
+    config_link = link_dir / "config.yaml"
+    config_link.symlink_to(real_config)
+
+    _migration_module().main(["--config", str(config_link), "--apply"])
+
+    assert config_link.is_symlink()
+    assert config_link.resolve() == real_config
+    config = _load_yaml(real_config)
+    assert "card_schema" not in config["display"]["platforms"]["feishu"]
+    assert "card_schema" not in config["gateway"]["platforms"]["feishu"]
+    assert "card_schema" not in config["gateway"]["platforms"]["feishu"]["extra"]
+    assert "card_schema" not in config["platforms"]["feishu"]["extra"]
+    assert config["platforms"]["telegram"]["extra"]["card_schema"] == "keep-me"
+    assert config_link.read_bytes() == real_config.read_bytes()
+    assert set(link_dir.iterdir()) == {config_link}
+
+
+def test_apply_succeeds_without_posix_metadata_apis(tmp_path, monkeypatch):
+    migration = _migration_module()
+    config_path = _write_config(tmp_path)
+    fake_os_members = {
+        name: getattr(os, name)
+        for name in dir(os)
+        if name not in {"fchown", "fchmod", "geteuid"}
+    }
+    fake_os_members["name"] = "nt"
+    fake_os = type("FakeWindowsOs", (), fake_os_members)
+
+    monkeypatch.setattr(migration, "os", fake_os)
+    migration.main(["--config", str(config_path), "--apply"])
+
+    config = _load_yaml(config_path)
+    assert "card_schema" not in config["display"]["platforms"]["feishu"]
+    assert "card_schema" not in config["gateway"]["platforms"]["feishu"]
+    assert "card_schema" not in config["gateway"]["platforms"]["feishu"]["extra"]
+    assert "card_schema" not in config["platforms"]["feishu"]["extra"]
+    assert config["platforms"]["telegram"]["extra"]["card_schema"] == "keep-me"
+
+
+def test_apply_retries_successful_short_writes(tmp_path, monkeypatch):
+    config_path = _write_config(tmp_path)
+    real_write = os.write
+    write_calls = 0
+
+    def short_write(fd, data):
+        nonlocal write_calls
+        write_calls += 1
+        return real_write(fd, data[:7])
+
+    monkeypatch.setattr(os, "write", short_write)
+    _migration_module().main(["--config", str(config_path), "--apply"])
+
+    assert write_calls > 1
+    config = _load_yaml(config_path)
+    assert "card_schema" not in config["display"]["platforms"]["feishu"]
+
+
+def test_apply_zero_progress_write_keeps_original_and_cleans_temp(tmp_path, monkeypatch):
+    config_path = _write_config(tmp_path)
+    before = config_path.read_bytes()
+    before_entries = set(tmp_path.iterdir())
+    monkeypatch.setattr(os, "write", lambda _fd, _data: 0)
+
+    with pytest.raises(OSError, match="made no progress"):
+        _migration_module().main(["--config", str(config_path), "--apply"])
+
+    assert config_path.read_bytes() == before
+    assert set(tmp_path.iterdir()) == before_entries
+
+
+@pytest.mark.skipif(not hasattr(os, "fchmod"), reason="requires POSIX fchmod fault injection")
+def test_apply_fchmod_failure_keeps_original_and_cleans_temp(tmp_path, monkeypatch):
+    config_path = _write_config(tmp_path)
+    before = config_path.read_bytes()
+    before_entries = set(tmp_path.iterdir())
+
+    def reject_fchmod(_fd, _mode):
+        raise OSError(errno.EPERM, "fchmod rejected")
+
+    monkeypatch.setattr(os, "fchmod", reject_fchmod)
+
+    with pytest.raises(OSError, match="fchmod rejected"):
+        _migration_module().main(["--config", str(config_path), "--apply"])
+
+    assert config_path.read_bytes() == before
+    assert set(tmp_path.iterdir()) == before_entries
+
+
+def test_apply_replace_then_error_restores_original_bytes_and_metadata(
+    tmp_path, monkeypatch
+):
+    config_path = _write_config(tmp_path)
+    config_path.chmod(0o640)
+    before = config_path.read_bytes()
+    before_stat = config_path.stat()
+    real_replace = os.replace
+    replace_calls = 0
+
+    def replace_then_fail_once(source, destination):
+        nonlocal replace_calls
+        replace_calls += 1
+        real_replace(source, destination)
+        if replace_calls == 1:
+            raise OSError(errno.EIO, "post-replace failure")
+
+    monkeypatch.setattr(os, "replace", replace_then_fail_once)
+
+    with pytest.raises(OSError, match="post-replace failure"):
+        _migration_module().main(["--config", str(config_path), "--apply"])
+
+    after_stat = config_path.stat()
+    assert replace_calls == 2
+    assert config_path.read_bytes() == before
+    assert (after_stat.st_uid, after_stat.st_gid, stat.S_IMODE(after_stat.st_mode)) == (
+        before_stat.st_uid,
+        before_stat.st_gid,
+        stat.S_IMODE(before_stat.st_mode),
+    )
+    assert not list(tmp_path.glob(".config.yaml.*.tmp"))
+
+
+def test_apply_post_write_semantic_failure_restores_original(tmp_path, monkeypatch):
+    migration = _migration_module()
+    config_path = _write_config(tmp_path)
+    before = config_path.read_bytes()
+    before_stat = config_path.stat()
+    real_verify = migration._verify_migrated_text
+    verify_calls = 0
+
+    def fail_second_verify(text, expected_unrelated):
+        nonlocal verify_calls
+        verify_calls += 1
+        if verify_calls == 2:
+            raise ValueError("post-write semantic rejection")
+        return real_verify(text, expected_unrelated)
+
+    monkeypatch.setattr(migration, "_verify_migrated_text", fail_second_verify)
+
+    with pytest.raises(ValueError, match="post-write semantic rejection"):
+        migration.main(["--config", str(config_path), "--apply"])
+
+    after_stat = config_path.stat()
+    assert config_path.read_bytes() == before
+    assert (after_stat.st_uid, after_stat.st_gid, stat.S_IMODE(after_stat.st_mode)) == (
+        before_stat.st_uid,
+        before_stat.st_gid,
+        stat.S_IMODE(before_stat.st_mode),
+    )
+
+
+@pytest.mark.skipif(not hasattr(os, "fchown"), reason="requires POSIX owner metadata")
+def test_apply_passes_original_owner_to_atomic_replace(tmp_path, monkeypatch):
+    migration = _migration_module()
+    config_path = _write_config(tmp_path)
+    before_stat = config_path.stat()
+    real_atomic_replace = migration._atomic_replace_bytes
+    owner_arguments = []
+
+    def capture_owner(path, data, mode, owner_uid, owner_gid):
+        owner_arguments.append((owner_uid, owner_gid))
+        return real_atomic_replace(path, data, mode, owner_uid, owner_gid)
+
+    monkeypatch.setattr(migration, "_atomic_replace_bytes", capture_owner)
+    migration.main(["--config", str(config_path), "--apply"])
+
+    assert owner_arguments == [(before_stat.st_uid, before_stat.st_gid)]

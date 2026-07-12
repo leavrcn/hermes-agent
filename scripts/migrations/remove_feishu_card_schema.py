@@ -161,10 +161,10 @@ def _atomic_replace_bytes(
     config_path: Path,
     data: bytes,
     mode: int,
-    owner_uid: int,
-    owner_gid: int,
+    owner_uid: int | None,
+    owner_gid: int | None,
 ) -> None:
-    """Durably replace ``config_path`` while preserving mode and ownership."""
+    """Durably replace ``config_path`` while preserving supported metadata."""
     fd, temp_name = tempfile.mkstemp(
         prefix=f".{config_path.name}.",
         suffix=".tmp",
@@ -179,11 +179,18 @@ def _atomic_replace_bytes(
                 raise OSError(errno.EIO, "temporary configuration write made no progress")
             remaining = remaining[written:]
 
-        # mkstemp creates an inode owned by the migration process. Restore the
-        # source inode's ownership before rename, then restore mode because
-        # chown may clear setuid/setgid bits on supported filesystems.
-        os.fchown(fd, owner_uid, owner_gid)
-        os.fchmod(fd, mode)
+        # mkstemp creates an inode owned by the migration process. On POSIX,
+        # restore the source inode's ownership before rename, then restore mode
+        # because chown may clear setuid/setgid bits. Native Windows does not
+        # expose fchown/fchmod; chmod after replace is its supported fallback.
+        if (
+            owner_uid is not None
+            and owner_gid is not None
+            and hasattr(os, "fchown")
+        ):
+            os.fchown(fd, owner_uid, owner_gid)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
         # os.write is unbuffered, so there is no userspace buffer to flush.
         # fsync publishes every completed write and metadata update before the
         # atomic rename.
@@ -194,13 +201,17 @@ def _atomic_replace_bytes(
         os.replace(temp_path, config_path)
         temp_path = None
 
-        # Persist the directory entry update as well as the file contents.
-        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        directory_fd = os.open(config_path.parent, directory_flags)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        if not hasattr(os, "fchmod") and hasattr(os, "chmod"):
+            os.chmod(config_path, mode)
+
+        # Persist directory entry updates where directory fsync is supported.
+        if getattr(os, "name", None) == "posix":
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            directory_fd = os.open(config_path.parent, directory_flags)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -213,6 +224,10 @@ def _atomic_replace_bytes(
 
 def migrate_config(config_path: Path, *, apply: bool) -> list[str]:
     """Remove Feishu card_schema lines without changing any other file bytes."""
+    # Atomic replacement must target the real file. Replacing a symlink path
+    # would silently detach managed dotfiles/profile deployments.
+    if config_path.is_symlink():
+        config_path = config_path.resolve(strict=True)
     original_bytes = config_path.read_bytes()
     source_text = original_bytes.decode("utf-8")
     config = _round_trip_load(source_text)
@@ -240,8 +255,22 @@ def migrate_config(config_path: Path, *, apply: bool) -> list[str]:
     _verify_migrated_text(migrated_text, expected_unrelated)
     original_stat = config_path.stat()
     original_mode = original_stat.st_mode & 0o7777
-    original_uid = original_stat.st_uid
-    original_gid = original_stat.st_gid
+    preserve_owner = (
+        hasattr(os, "fchown")
+        and hasattr(original_stat, "st_uid")
+        and hasattr(original_stat, "st_gid")
+    )
+    original_uid = getattr(original_stat, "st_uid", None) if preserve_owner else None
+    original_gid = getattr(original_stat, "st_gid", None) if preserve_owner else None
+    verify_posix_mode = getattr(os, "name", None) == "posix"
+
+    def metadata_matches(current_stat: os.stat_result) -> bool:
+        if preserve_owner and (
+            current_stat.st_uid != original_uid or current_stat.st_gid != original_gid
+        ):
+            return False
+        return not verify_posix_mode or current_stat.st_mode & 0o7777 == original_mode
+
     try:
         _atomic_replace_bytes(
             config_path,
@@ -253,30 +282,16 @@ def migrate_config(config_path: Path, *, apply: bool) -> list[str]:
         written_bytes = config_path.read_bytes()
         if written_bytes != migrated_bytes:
             raise ValueError("written configuration differs from validated migration bytes")
-        written_stat = config_path.stat()
-        written_identity = (
-            written_stat.st_uid,
-            written_stat.st_gid,
-            written_stat.st_mode & 0o7777,
-        )
-        expected_identity = (original_uid, original_gid, original_mode)
-        if written_identity != expected_identity:
+        if not metadata_matches(config_path.stat()):
             raise ValueError("written configuration ownership or mode changed")
         # Re-parse the actual on-disk result and re-check migration scope.
         _verify_migrated_text(written_bytes.decode("utf-8"), expected_unrelated)
     except Exception:
         # A temp-write or replace failure leaves the original path untouched.
-        # If post-replace verification failed, restore both bytes and inode
-        # metadata through the same atomic path rather than truncating in place.
-        current_stat = config_path.stat()
-        current_identity = (
-            current_stat.st_uid,
-            current_stat.st_gid,
-            current_stat.st_mode & 0o7777,
-        )
-        if (
-            config_path.read_bytes() != original_bytes
-            or current_identity != (original_uid, original_gid, original_mode)
+        # If post-replace verification failed, restore bytes and every supported
+        # metadata field through the same atomic path.
+        if config_path.read_bytes() != original_bytes or not metadata_matches(
+            config_path.stat()
         ):
             _atomic_replace_bytes(
                 config_path,
