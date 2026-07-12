@@ -324,13 +324,14 @@ class TestSendMessageTool:
         config, _telegram_cfg = _make_config()
         config.get_home_channel = lambda _platform: home
 
-        with patch.dict(
-            os.environ,
-            {
-                "HERMES_CRON_AUTO_DELIVER_PLATFORM": "telegram",
-                "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "-1001",
-            },
-            clear=False,
+        cron_env = {
+            "HERMES_CRON_AUTO_DELIVER_PLATFORM": "telegram",
+            "HERMES_CRON_AUTO_DELIVER_CHAT_ID": "-1001",
+            "HERMES_CRON_AUTO_DELIVER_THREAD_ID": "",
+        }
+        with patch(
+            "gateway.session_context.get_session_env",
+            side_effect=lambda name, default="": cron_env.get(name, default),
         ), \
              patch("gateway.config.load_gateway_config", return_value=config), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
@@ -539,6 +540,7 @@ class TestSendMessageTool:
         # in 2026-05; this test pins strict on explicitly.)
         monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "1")
         monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", "")
         config, telegram_cfg = _make_config()
         secret = tmp_path / "secret.pdf"
         secret.write_bytes(b"%PDF secret")

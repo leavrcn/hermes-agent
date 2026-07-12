@@ -727,6 +727,9 @@ class TestMediaDeliveryPathValidation:
         # tests continue to exercise the strict-allowlist path. Tests that
         # specifically cover recency trust re-enable it themselves.
         monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
+        # Do not inherit operator roots (for example /tmp) loaded from the
+        # real gateway .env; individual tests opt in explicitly when needed.
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", "")
 
     def test_allows_existing_file_inside_safe_root(self, tmp_path, monkeypatch):
         root = tmp_path / "media-cache"
@@ -1757,7 +1760,8 @@ class TestMediaDeliveryDiagnosability:
         outside = tmp_path / "outside.ogg"
         outside.write_bytes(b"OggS")
         with patch.dict(os.environ, {"HERMES_MEDIA_DELIVERY_STRICT": "1",
-                                     "HERMES_MEDIA_TRUST_RECENT_FILES": "0"}), \
+                                     "HERMES_MEDIA_TRUST_RECENT_FILES": "0",
+                                     "HERMES_MEDIA_ALLOW_DIRS": ""}), \
                 patch("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", ()):
             with caplog.at_level("WARNING"):
                 out = BasePlatformAdapter.filter_media_delivery_paths([(str(outside), False)])
