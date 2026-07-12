@@ -223,6 +223,57 @@ async def test_post_stream_media_failure_is_sticky_while_later_media_still_sends
 
 
 @pytest.mark.asyncio
+async def test_post_stream_media_empty_set_is_success_without_sender_calls():
+    adapter = _streaming_adapter()
+
+    result = await GatewayRunner._deliver_media_from_response(
+        _fake_runner(None),
+        "streamed text without attachments",
+        _event(),
+        adapter,
+    )
+
+    assert result.success is True
+    assert result.raw_response == {"attempts": []}
+    adapter.send_multiple_images.assert_not_awaited()
+    adapter.send_voice.assert_not_awaited()
+    adapter.send_video.assert_not_awaited()
+    adapter.send_document.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_stream_media_failure_is_sticky_after_earlier_success(
+    tmp_path, monkeypatch
+):
+    delivered = _allowed_media_path(tmp_path, monkeypatch, "delivered.mp4")
+    rejected = _allowed_media_path(tmp_path, monkeypatch, "rejected.pdf")
+    adapter = _streaming_adapter(
+        send_video=AsyncMock(
+            return_value=SendResult(success=True, message_id="video")
+        ),
+        send_document=AsyncMock(
+            return_value=SendResult(success=False, error="upload rejected")
+        ),
+    )
+
+    result = await GatewayRunner._deliver_media_from_response(
+        _fake_runner(None),
+        f"MEDIA:{delivered}\nMEDIA:{rejected}",
+        _event(),
+        adapter,
+    )
+
+    assert result.success is False
+    assert "upload rejected" in (result.error or "")
+    assert [attempt["kind"] for attempt in result.raw_response["attempts"]] == [
+        "video",
+        "document",
+    ]
+    adapter.send_video.assert_awaited_once()
+    adapter.send_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_base_processing_consumes_stream_delivery_failure_without_error_reply(caplog):
     adapter = _MediaRoutingAdapter()
     event = _event()

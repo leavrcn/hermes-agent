@@ -244,3 +244,38 @@ def test_apply_atomic_replace_preserves_original_permissions(tmp_path):
     _migration_module().main(["--config", str(config_path), "--apply"])
 
     assert stat.S_IMODE(config_path.stat().st_mode) == before_mode
+
+
+def test_apply_chown_failure_keeps_original_and_cleans_temp_file(tmp_path, monkeypatch):
+    config_path = _write_config(tmp_path)
+    before = config_path.read_bytes()
+    before_entries = set(tmp_path.iterdir())
+
+    def reject_chown(_fd, _uid, _gid):
+        raise OSError(errno.EPERM, "chown rejected")
+
+    monkeypatch.setattr(os, "fchown", reject_chown)
+
+    with pytest.raises(OSError, match="chown rejected"):
+        _migration_module().main(["--config", str(config_path), "--apply"])
+
+    assert config_path.read_bytes() == before
+    assert set(tmp_path.iterdir()) == before_entries
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="requires root to create a foreign-owned fixture")
+def test_apply_atomic_replace_preserves_original_owner_group(tmp_path):
+    config_path = _write_config(tmp_path)
+    original_uid = 65534
+    original_gid = 65534
+    os.chown(config_path, original_uid, original_gid)
+    before_stat = config_path.stat()
+
+    _migration_module().main(["--config", str(config_path), "--apply"])
+
+    after_stat = config_path.stat()
+    assert (after_stat.st_uid, after_stat.st_gid) == (
+        before_stat.st_uid,
+        before_stat.st_gid,
+    )
+    assert stat.S_IMODE(after_stat.st_mode) == stat.S_IMODE(before_stat.st_mode)

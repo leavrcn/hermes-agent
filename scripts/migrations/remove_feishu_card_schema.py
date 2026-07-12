@@ -157,8 +157,14 @@ def _verify_migrated_text(
         raise ValueError("non-Feishu card_schema settings changed during migration")
 
 
-def _atomic_replace_bytes(config_path: Path, data: bytes, mode: int) -> None:
-    """Durably replace ``config_path`` without exposing a truncated file."""
+def _atomic_replace_bytes(
+    config_path: Path,
+    data: bytes,
+    mode: int,
+    owner_uid: int,
+    owner_gid: int,
+) -> None:
+    """Durably replace ``config_path`` while preserving mode and ownership."""
     fd, temp_name = tempfile.mkstemp(
         prefix=f".{config_path.name}.",
         suffix=".tmp",
@@ -166,15 +172,21 @@ def _atomic_replace_bytes(config_path: Path, data: bytes, mode: int) -> None:
     )
     temp_path = Path(temp_name)
     try:
-        os.fchmod(fd, mode)
         remaining = memoryview(data)
         while remaining:
             written = os.write(fd, remaining)
             if written <= 0:
                 raise OSError(errno.EIO, "temporary configuration write made no progress")
             remaining = remaining[written:]
+
+        # mkstemp creates an inode owned by the migration process. Restore the
+        # source inode's ownership before rename, then restore mode because
+        # chown may clear setuid/setgid bits on supported filesystems.
+        os.fchown(fd, owner_uid, owner_gid)
+        os.fchmod(fd, mode)
         # os.write is unbuffered, so there is no userspace buffer to flush.
-        # fsync publishes every completed write before the atomic rename.
+        # fsync publishes every completed write and metadata update before the
+        # atomic rename.
         os.fsync(fd)
         os.close(fd)
         fd = -1
@@ -226,20 +238,53 @@ def migrate_config(config_path: Path, *, apply: bool) -> list[str]:
 
     # Validate before writing so unsupported input can never damage the source file.
     _verify_migrated_text(migrated_text, expected_unrelated)
-    original_mode = config_path.stat().st_mode & 0o7777
+    original_stat = config_path.stat()
+    original_mode = original_stat.st_mode & 0o7777
+    original_uid = original_stat.st_uid
+    original_gid = original_stat.st_gid
     try:
-        _atomic_replace_bytes(config_path, migrated_bytes, original_mode)
+        _atomic_replace_bytes(
+            config_path,
+            migrated_bytes,
+            original_mode,
+            original_uid,
+            original_gid,
+        )
         written_bytes = config_path.read_bytes()
         if written_bytes != migrated_bytes:
             raise ValueError("written configuration differs from validated migration bytes")
+        written_stat = config_path.stat()
+        written_identity = (
+            written_stat.st_uid,
+            written_stat.st_gid,
+            written_stat.st_mode & 0o7777,
+        )
+        expected_identity = (original_uid, original_gid, original_mode)
+        if written_identity != expected_identity:
+            raise ValueError("written configuration ownership or mode changed")
         # Re-parse the actual on-disk result and re-check migration scope.
         _verify_migrated_text(written_bytes.decode("utf-8"), expected_unrelated)
     except Exception:
         # A temp-write or replace failure leaves the original path untouched.
-        # If only post-replace verification failed, restore the original bytes
-        # through the same atomic path rather than truncating in place.
-        if config_path.read_bytes() != original_bytes:
-            _atomic_replace_bytes(config_path, original_bytes, original_mode)
+        # If post-replace verification failed, restore both bytes and inode
+        # metadata through the same atomic path rather than truncating in place.
+        current_stat = config_path.stat()
+        current_identity = (
+            current_stat.st_uid,
+            current_stat.st_gid,
+            current_stat.st_mode & 0o7777,
+        )
+        if (
+            config_path.read_bytes() != original_bytes
+            or current_identity != (original_uid, original_gid, original_mode)
+        ):
+            _atomic_replace_bytes(
+                config_path,
+                original_bytes,
+                original_mode,
+                original_uid,
+                original_gid,
+            )
         raise
 
     return removed_paths
