@@ -161,6 +161,62 @@ def test_single_inline_code_token_larger_than_budget_is_safely_degraded():
     )
 
 
+def _expected_atom_degradation(raw, special):
+    """Independently escape only delimiters that are not escaped already."""
+    result = []
+    for index, char in enumerate(raw):
+        if char in special:
+            slash_count = 0
+            cursor = index - 1
+            while cursor >= 0 and raw[cursor] == "\\":
+                slash_count += 1
+                cursor -= 1
+            if slash_count % 2 == 0:
+                result.append("\\")
+        result.append(char)
+    return "".join(result)
+
+
+def test_public_pipeline_preserves_existing_escape_parity_in_oversized_link():
+    source = "[" + ("a" * 100) + r"\`" + ("b" * 3100) + r"\`" + "](u)"
+
+    elements = _markdown_elements(build_feishu_card_v2_payloads(source))
+    chunks = [element["content"] for element in elements]
+
+    assert chunks
+    assert all(len(chunk.encode("utf-8")) <= 3000 for chunk in chunks)
+    assert "".join(chunks) == _expected_atom_degradation(source, "`[]()")
+
+
+@pytest.mark.parametrize("slash_count", range(4))
+def test_oversized_atom_escape_parity_combinations_are_lossless(slash_count):
+    marker = ("\\" * slash_count) + "`"
+    source = "[" + ("p" * 120) + marker + ("x" * 3100) + marker + "](url)"
+    expected = _expected_atom_degradation(source, "`[]()")
+
+    elements = _markdown_elements(build_feishu_card_v2_payloads(source))
+    chunks = [element["content"] for element in elements]
+
+    assert chunks
+    assert all(len(chunk.encode("utf-8")) <= 3000 for chunk in chunks)
+    assert "".join(chunks) == expected
+
+
+def test_each_remaining_round_degrades_newly_exposed_oversized_atom():
+    nested_link = "[" + ("x" * 3100) + "](url)"
+    source = "`" + ("prefix" * 20) + nested_link + "`"
+    expected = r"\`" + ("prefix" * 20) + _expected_atom_degradation(
+        nested_link, "`[]()"
+    ) + r"\`"
+
+    elements = _markdown_elements(build_feishu_card_v2_payloads(source))
+    chunks = [element["content"] for element in elements]
+
+    assert len(chunks) > 1
+    assert all(len(chunk.encode("utf-8")) <= 3000 for chunk in chunks)
+    assert "".join(chunks) == expected
+
+
 def test_no_empty_chunks():
     """No split piece should be empty."""
     payloads = build_feishu_card_v2_payloads("x" * 9000)

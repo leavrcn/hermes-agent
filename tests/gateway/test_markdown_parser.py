@@ -1,5 +1,7 @@
 """Tests for the gateway Markdown-to-document parser."""
 
+import pytest
+
 from gateway.rendering.document import DividerBlock, ParagraphBlock, TableBlock
 from gateway.rendering.markdown_parser import parse_markdown_document
 
@@ -114,3 +116,29 @@ def test_later_uncertain_row_degrades_entire_table_without_loss():
     assert "| first | ok |" in block.text
     assert "| `uncertain | still here |" in block.text
     assert "| after | survives |" in block.text
+
+
+@pytest.mark.parametrize(
+    "mismatched_row",
+    [
+        "| too | many | SECRET |",
+        "| too-few |",
+    ],
+    ids=["wider-than-header", "narrower-than-header"],
+)
+def test_row_width_mismatch_degrades_entire_table_without_loss(mismatched_row):
+    markdown = (
+        "| A | B |\n"
+        "| --- | --- |\n"
+        "| before | survives |\n"
+        f"{mismatched_row}\n"
+        "| after | also-survives |"
+    )
+
+    doc = parse_markdown_document(markdown)
+
+    assert len(doc.blocks) == 1
+    block = doc.blocks[0]
+    assert isinstance(block, ParagraphBlock)
+    assert block.text == markdown
+    assert mismatched_row in block.text

@@ -8,7 +8,6 @@ for lossless fallback.
 from __future__ import annotations
 
 import re
-from typing import Iterable
 
 from gateway.rendering.document import (
     CodeBlock,
@@ -111,10 +110,10 @@ def _parse_table_at(lines: list[str], start: int) -> tuple[TableBlock | Paragrap
             break
         raw_lines.append(candidate)
         row = _split_table_row(candidate)
-        if row is None:
+        if row is None or len(row) != len(header):
             uncertain = True
         else:
-            rows.append(_fit_row(row, len(header)))
+            rows.append(row)
         i += 1
 
     # Do not commit a partial TableBlock. Once a header and separator establish
@@ -225,10 +224,3 @@ def _split_table_row(line: str) -> list[str] | None:
 def _is_separator_cell(cell: str) -> bool:
     compact = cell.replace(" ", "")
     return bool(_TABLE_SEPARATOR_CELL_RE.match(compact))
-
-
-def _fit_row(row: Iterable[str], width: int) -> list[str]:
-    fitted = list(row)[:width]
-    if len(fitted) < width:
-        fitted.extend("" for _ in range(width - len(fitted)))
-    return fitted

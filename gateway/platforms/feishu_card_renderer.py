@@ -507,8 +507,14 @@ def _markdown_atom_spans(text: str) -> list[tuple[int, int, str]]:
 
 
 def _escape_oversized_markdown_atom(raw: str, kind: str) -> str:
+    """Make atom delimiters literal without flipping existing escape parity."""
     special = "`" if kind == "inline_code" else "`[]()"
-    return "".join(f"\\{char}" if char in special else char for char in raw)
+    escaped: list[str] = []
+    for index, char in enumerate(raw):
+        if char in special and not _is_markdown_escaped(raw, index):
+            escaped.append("\\")
+        escaped.append(char)
+    return "".join(escaped)
 
 
 def _degrade_oversized_markdown_atoms(text: str, max_bytes: int) -> str:
@@ -629,11 +635,20 @@ def _split_markdown_by_utf8_bytes(content: str, max_bytes: int) -> list[str]:
             f"markdown byte budget {max_bytes} is too small for safe splitting"
         )
     remaining = _degrade_oversized_fence_openers(content, max_bytes)
-    remaining = _degrade_oversized_markdown_atoms(remaining, max_bytes)
     parts: list[str] = []
 
-    while len(remaining.encode("utf-8")) > max_bytes:
-        previous_remaining_bytes = len(remaining.encode("utf-8"))
+    while remaining:
+        # Splitting can expose a previously protected atom at the start of the
+        # rewritten remainder. Re-scan every round instead of assuming the
+        # initial degradation remains sufficient after synthetic markup and
+        # escape boundaries are introduced.
+        remaining = _degrade_oversized_markdown_atoms(remaining, max_bytes)
+        remaining_bytes = len(remaining.encode("utf-8"))
+        if remaining_bytes <= max_bytes:
+            parts.append(remaining)
+            break
+
+        previous_remaining_bytes = remaining_bytes
         split_at = _find_safe_split_point(remaining, max_bytes)
         if split_at <= 0:
             raise FeishuCardRenderingError(
@@ -675,10 +690,6 @@ def _split_markdown_by_utf8_bytes(content: str, max_bytes: int) -> list[str]:
         parts.append(part)
         remaining = rest
 
-    if remaining:
-        if len(remaining.encode("utf-8")) > max_bytes:
-            raise FeishuCardRenderingError("final markdown chunk exceeds byte budget")
-        parts.append(remaining)
     return parts
 
 
